@@ -63,7 +63,7 @@ Invariants:
 
 ## Reference model (`meteor_logic/`)
 
-A standard-library Python model of the connection and operation rules, with an SQLite-backed journal. Its acceptance tests (`python -m unittest meteor_logic.test_core`) document the intended behaviour independently of Android, including the planned Xen Orchestra provider. `python -m meteor_logic.scenarios` writes a JSON trace of eight scenarios (lost reply, reconnect during a task, VM migration and more) for inspection.
+A standard-library Python model of the connection and operation rules, with an SQLite-backed journal. Its tests (`python -m unittest meteor_logic.test_core`) document the intended behaviour independently of Android, including the planned Xen Orchestra provider. `python -m meteor_logic.scenarios` writes a JSON trace of eight scenarios (lost reply, reconnect during a task, VM migration and more) for inspection.
 
 ## Testing strategy
 
@@ -71,5 +71,5 @@ A standard-library Python model of the connection and operation rules, with an S
 | --- | --- | --- |
 | XML-RPC, endpoint, inventory mapping, power rules and engine | `app/src/test` | JVM, in CI |
 | Real TLS + pinning + XML-RPC over loopback | `XapiTransportIntegrationTest` | JVM, in CI |
-| Keystore vault, journal files, icon import, ViewModel races, Compose UI journeys | `app/src/androidTest` | Disposable emulator (`candidate` build) |
+| Keystore vault, journal files, icon import, ViewModel races, Compose UI journeys | `app/src/androidTest` | Android emulator (`candidate` build type) |
 | Domain rules, independent of Android | `meteor_logic/test_core.py` | Python, in CI |

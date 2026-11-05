@@ -78,7 +78,7 @@ android-app/                Gradle project (single :app module)
   app/src/main/…/           Compose UI and ViewModel
   app/src/test/             JVM unit tests, including a real loopback HTTPS/XAPI fixture
   app/src/androidTest/      Offline instrumentation tests (vault, journal, UI journeys, races)
-meteor_logic/               Python reference model and its acceptance tests
+meteor_logic/               Python reference model and its tests
 scripts/                    Repository checks: source guard and version helper
 design/                     Interactive HTML design studies
 docs/                       Architecture notes
@@ -98,12 +98,12 @@ From the repository root:
 ```sh
 python scripts/source_guard.py                         # blocks private-key headers, GitHub tokens, credential/keystore files and build artefacts
 python -m unittest discover -s scripts -p test_safety.py
-python -m unittest meteor_logic.test_core              # reference-model acceptance tests
+python -m unittest meteor_logic.test_core              # reference-model tests
 ```
 
 The JVM unit tests need no device or network. The transport tests start a local HTTPS server with a temporary self-signed certificate. CI ([`.github/workflows/validate.yml`](.github/workflows/validate.yml)) runs all of the above on Ubuntu and needs no secrets.
 
-The `candidate` build type produces a non-debuggable, release-like APK with its own application ID (`com.meteor.app.candidate`), signed with the local debug key so it can be installed side by side for testing. The instrumentation tests in `app/src/androidTest` target this build. They are fully offline and use isolated, synthetic storage, but some of them create and corrupt their own test files, so run them on a **disposable emulator**:
+Instrumentation tests in `app/src/androidTest` run offline with synthetic storage against a release-like build type (`candidate`, application ID `com.meteor.app.candidate`) that installs alongside a debug build. Some tests deliberately corrupt their own files, so run them on an emulator:
 
 ```sh
 ./gradlew -PmeteorTestBuildType=candidate :app:assembleCandidate :app:connectedCandidateAndroidTest
