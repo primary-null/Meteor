@@ -29,7 +29,7 @@ XCP-ng hosts usually serve self-signed certificates, so Meteor replaces CA trust
 - Every later request requires the exact SHA-256 pin, a currently valid certificate and the expected hostname. A changed certificate fails with a distinct `CertificateChanged` error, so the UI can ask you to verify again rather than reporting a generic failure.
 - Redirects are refused, responses are capped at 8 MiB, and only `https://host[:port]/` endpoints without paths, queries or embedded credentials are accepted. Cleartext traffic is disabled for the whole app.
 - The XML-RPC parser (`XmlRpc.kt`) rejects DTDs and entities, limits nesting depth and node count, rejects duplicate struct fields, and turns XAPI failures into error codes without echoing server-supplied arguments.
-- Each operation runs in a short-lived session that always logs out, including when a response is malformed.
+- Each operation runs in a short-lived session. Once login has returned a session, Meteor attempts `session.logout` in a `finally` block, including when a later response is malformed. Logout is best-effort, and a failed logout is ignored.
 
 ### Encrypted connection profiles
 
@@ -96,7 +96,7 @@ cd android-app
 From the repository root:
 
 ```sh
-python scripts/source_guard.py                         # blocks keys, tokens and build artefacts from the tree
+python scripts/source_guard.py                         # blocks private-key headers, GitHub tokens, credential/keystore files and build artefacts
 python -m unittest discover -s scripts -p test_safety.py
 python -m unittest meteor_logic.test_core              # reference-model acceptance tests
 ```
