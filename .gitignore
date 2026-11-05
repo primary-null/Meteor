@@ -1,0 +1,25 @@
+# Local SDK paths, credentials and build products never belong in the repository.
+**/local.properties
+**/.gradle/
+**/build/
+**/__pycache__/
+**/.idea/
+**/.kotlin/
+**/.cxx/
+**/.externalNativeBuild/
+**/captures/
+*.apk
+*.apks
+*.aab
+*.jks
+*.keystore
+*.pem
+*.p12
+*.pfx
+*.key
+*.env
+.env.*
+*.log
+*.tmp
+# Output of `python -m meteor_logic.scenarios`
+meteor-logic-scenarios.json
