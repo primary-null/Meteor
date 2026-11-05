@@ -125,4 +125,4 @@ Meteor is meant for private networks or a VPN. It does not expose any listening 
 
 ## License
 
-No license has been chosen yet. See [LICENSE-TODO.md](LICENSE-TODO.md). Until a license is added, all rights are reserved.
+Released under the [MIT License](LICENSE).
