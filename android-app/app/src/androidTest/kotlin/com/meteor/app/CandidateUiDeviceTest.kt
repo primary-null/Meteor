@@ -1,15 +1,22 @@
 package com.meteor.app
 
 import android.app.Application
+import android.text.InputType
+import android.view.inputmethod.EditorInfo
 import androidx.activity.compose.setContent
 import androidx.lifecycle.viewModelScope
 import androidx.compose.ui.test.assertIsDisplayed
 import androidx.compose.ui.test.assertIsSelected
+import androidx.compose.ui.test.assertTextContains
 import androidx.compose.ui.test.junit4.createAndroidComposeRule
 import androidx.compose.ui.test.onNodeWithText
+import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.hasText
+import androidx.compose.ui.test.performScrollToNode
 import androidx.compose.ui.test.performClick
 import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performTextInput
+import androidx.compose.ui.test.performTextClearance
 import androidx.test.ext.junit.runners.AndroidJUnit4
 import androidx.test.core.app.ApplicationProvider
 import com.meteor.app.data.*
@@ -54,7 +61,128 @@ class CandidateUiDeviceTest {
         compose.onNodeWithText("Username").performScrollTo().performTextInput("fixture")
         compose.onNodeWithText("Password").performScrollTo().performTextInput("fixture")
         compose.onNodeWithText("Review certificate").performScrollTo().performClick()
+        compose.waitUntil(5_000) { runCatching {
+            compose.onNodeWithText("Enter an HTTPS server address without a path or credentials.").assertIsDisplayed(); true
+        }.getOrDefault(false) }
         compose.onNodeWithText("Enter an HTTPS server address without a path or credentials.").assertIsDisplayed()
+    }
+
+    @Test fun passwordFieldUsesPasswordKeyboardWithoutAutocorrection() {
+        compose.onNodeWithText("Connect", useUnmergedTree = true).performClick()
+        compose.onNodeWithText("Password", substring = false).performScrollTo().performClick()
+        compose.waitForIdle()
+        compose.activityRule.scenario.onActivity { activity ->
+            val focused = requireNotNull(activity.currentFocus)
+            val info = EditorInfo()
+            assertNotNull(focused.onCreateInputConnection(info))
+            assertEquals(InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD,
+                info.inputType and (InputType.TYPE_MASK_CLASS or InputType.TYPE_MASK_VARIATION))
+            assertEquals(0, info.inputType and InputType.TYPE_TEXT_FLAG_AUTO_CORRECT)
+        }
+    }
+
+    @Test fun connectionEditorRenamesWithoutExposingPasswordsThenDisconnectsAndForgets() = runBlocking {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+        val vaultName = "instrumentation-connection-ui.secured"
+        val journalName = "instrumentation-connection-ui.json"
+        val alias = "meteor.instrumentation.connection-ui"
+        val profile = Profile("fixture", "Fixture", "https://test.invalid/", "tester", "fixture", "a".repeat(64))
+        val reads = AtomicInteger()
+        val backend = object : MeteorGateway {
+            override suspend fun inventory(profile: Profile): Inventory {
+                reads.incrementAndGet()
+                return Inventory("pool", "Fixture pool", emptyList(), emptyList(), 0, 0, System.currentTimeMillis())
+            }
+            override suspend fun details(profile: Profile, authority: String, uuid: String): VmDetails = error("No detail reads expected")
+            override suspend fun <T> powerConnection(profile: Profile, action: suspend PowerConnection.() -> T): T = error("No power requests expected")
+        }
+        val vault = ProfileVault(application, vaultName, alias)
+        var fixture: MeteorViewModel? = null
+        try {
+            vault.save(ProfileDocument(listOf(profile), profile.id))
+            compose.activityRule.scenario.onActivity { activity ->
+                fixture = MeteorViewModel(application, backend, vault, OperationJournal(application, journalName))
+                activity.setContent { MeteorApp(requireNotNull(fixture)) }
+            }
+            val model = requireNotNull(fixture)
+            compose.waitUntil(15_000) { model.state.value.connected }
+            compose.onNodeWithText("Connect", useUnmergedTree = true).performClick()
+            compose.onNodeWithText("Certificate", substring = false).performScrollTo().performClick()
+            compose.onNodeWithText("Saved server certificate").assertIsDisplayed()
+            compose.onNodeWithText("Done", substring = false).performClick()
+            compose.onNodeWithText("Edit", substring = false).performScrollTo().performClick()
+            compose.onNodeWithText(profile.password, substring = false).assertDoesNotExist()
+            compose.onNodeWithText("Connection name").performScrollTo().performTextClearance()
+            compose.onNodeWithText("Connection name").performTextInput("Renamed")
+            compose.onNodeWithText("Save changes").performScrollTo().performClick()
+            compose.waitUntil(15_000) { !model.state.value.profileBusy && model.state.value.profiles.single().label == "Renamed" }
+            assertEquals(profile.copy(label = "Renamed"), vault.load().profiles.single())
+            assertEquals(1, reads.get())
+            compose.onNodeWithText("Disconnect", substring = false).performScrollTo().performClick()
+            compose.waitUntil(15_000) { !model.state.value.profileBusy && model.state.value.selectedId == null }
+            compose.onNodeWithText("Forget", substring = false).performScrollTo().performClick()
+            compose.onNodeWithText("Forget Renamed?").assertIsDisplayed()
+            compose.onNodeWithText("Forget connection", substring = false).performClick()
+            compose.waitUntil(15_000) { !model.state.value.profileBusy && model.state.value.profiles.isEmpty() }
+            assertTrue(vault.load().profiles.isEmpty())
+        } finally {
+            compose.activityRule.scenario.onActivity { fixture?.viewModelScope?.cancel() }
+            for (name in listOf(vaultName, journalName)) {
+                for (suffix in listOf("", ".bak", ".new")) File(application.filesDir, name + suffix).delete()
+            }
+            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(alias)
+        }
+        Unit
+    }
+
+    @Test fun disposedEditorsCannotRestoreAnotherProfilesDraftOrACancelledSession() = runBlocking {
+        val application = ApplicationProvider.getApplicationContext<Application>()
+        val vaultName = "instrumentation-editor-ui.secured"
+        val journalName = "instrumentation-editor-ui.json"
+        val alias = "meteor.instrumentation.editor-ui"
+        val profiles = (1..30).map { Profile("fixture-$it", "Fixture $it", "https://host-$it.invalid/", "tester-$it", "fixture", "a".repeat(64)) }
+        val backend = object : MeteorGateway {
+            override suspend fun inventory(profile: Profile) = Inventory("pool", "Fixture pool", emptyList(), emptyList(), 0, 0, System.currentTimeMillis())
+            override suspend fun details(profile: Profile, authority: String, uuid: String): VmDetails = error("No detail reads expected")
+            override suspend fun <T> powerConnection(profile: Profile, action: suspend PowerConnection.() -> T): T = error("No power requests expected")
+        }
+        val vault = ProfileVault(application, vaultName, alias)
+        var fixture: MeteorViewModel? = null
+        try {
+            vault.save(ProfileDocument(profiles, profiles.first().id))
+            compose.activityRule.scenario.onActivity { activity ->
+                fixture = MeteorViewModel(application, backend, vault, OperationJournal(application, journalName))
+                activity.setContent { MeteorApp(requireNotNull(fixture)) }
+            }
+            val model = requireNotNull(fixture)
+            compose.waitUntil(15_000) { model.state.value.connected }
+            compose.onNodeWithText("Connect", useUnmergedTree = true).performClick()
+            compose.runOnIdle { model.editProfile(profiles.first().id) }
+            compose.onNodeWithText("Connection name").performScrollTo().performTextClearance()
+            compose.onNodeWithText("Connection name").performTextInput("Unsaved first draft")
+            // Dispose the lazy editor before switching to the distant profile.
+            compose.onNodeWithTag("connections-list").performScrollToNode(hasText(profiles.last().label, substring = false))
+            compose.runOnIdle { model.editProfile(profiles.last().id) }
+            compose.onNodeWithText("Connection name").performScrollTo().assertTextContains(profiles.last().label)
+            compose.onNodeWithText("Server address").assertTextContains(profiles.last().endpoint)
+            compose.onNodeWithText("Username").assertTextContains(profiles.last().username)
+            compose.onNodeWithText("Save changes").performScrollTo().performClick()
+            compose.waitUntil(15_000) { !model.state.value.profileBusy && model.state.value.editingProfileId == null }
+            assertEquals(profiles, vault.load().profiles)
+            compose.runOnIdle { model.editProfile(profiles.first().id) }
+            compose.onNodeWithText("Connection name").performScrollTo().assertTextContains(profiles.first().label)
+            compose.onNodeWithText("Connection name").performTextClearance()
+            compose.onNodeWithText("Connection name").performTextInput("Cancelled draft")
+            compose.runOnIdle { model.cancelEdit(); model.editProfile(profiles.first().id) }
+            compose.onNodeWithText("Connection name").performScrollTo().assertTextContains(profiles.first().label)
+        } finally {
+            compose.activityRule.scenario.onActivity { fixture?.viewModelScope?.cancel() }
+            for (name in listOf(vaultName, journalName)) {
+                for (suffix in listOf("", ".bak", ".new")) File(application.filesDir, name + suffix).delete()
+            }
+            KeyStore.getInstance("AndroidKeyStore").apply { load(null) }.deleteEntry(alias)
+        }
+        Unit
     }
 
     @Test fun vmDetailsIconsAndPowerConfirmationSurviveRecreationWithoutSubmitting() = runBlocking {

@@ -34,7 +34,11 @@ android {
             matchingFallbacks += listOf("release")
         }
     }
-    testBuildType = providers.gradleProperty("meteorTestBuildType").getOrElse("debug")
+    // Explicit candidate instrumentation assembly works on fixed remote build profiles too.
+    // The property remains available for other candidate test/lint invocations.
+    testBuildType = providers.gradleProperty("meteorTestBuildType").getOrElse(
+        if (gradle.startParameter.taskNames.any { it.substringAfterLast(':') in
+            setOf("assembleCandidateAndroidTest", "testCandidateUnitTest", "lintCandidate") }) "candidate" else "debug")
     compileOptions {
         sourceCompatibility = JavaVersion.VERSION_17
         targetCompatibility = JavaVersion.VERSION_17

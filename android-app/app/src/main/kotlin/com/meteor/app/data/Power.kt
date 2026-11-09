@@ -19,6 +19,7 @@ data class VmDetails(
     val host: String?, val vcpus: Int, val memoryBytes: Long, val disks: List<VmDisk>, val networks: List<VmNetwork>,
     val guestToolsLive: Boolean, val os: String?, val addresses: List<String>, val bootTime: String?,
     val allowed: Set<String>, val currentOperations: Boolean, val observedAt: Long,
+    val topologyObservedAt: Long = observedAt, val topology: VmTopology? = null,
 )
 enum class PowerAction(val title: String, val operation: String, val before: String, val after: String) {
     START("Start", "start", "Halted", "Running"),
@@ -55,13 +56,21 @@ object PowerRules {
     fun eligible(vm: VmDetails, action: PowerAction): Boolean = vm.power == action.before &&
         !vm.currentOperations && action.operation in vm.allowed &&
         (action != PowerAction.REBOOT || validBoot(vm.bootTime))
-    fun validBoot(value: String?): Boolean {
-        if (value.isNullOrBlank()) return false
+    fun unavailableReason(vm: VmDetails, action: PowerAction): String? = when {
+        vm.currentOperations -> "Another VM operation is active."
+        vm.power != action.before -> "Requires the VM to be ${action.before.lowercase()}."
+        action.operation !in vm.allowed -> "The server does not currently allow this action."
+        action == PowerAction.REBOOT && !validBoot(vm.bootTime) -> "A valid last-boot time is needed to verify a reboot."
+        else -> null
+    }
+    private fun bootInstant(value: String?): Instant? {
+        if (value.isNullOrBlank()) return null
         val instant = runCatching { Instant.parse(value) }.getOrElse {
             runCatching { LocalDateTime.parse(value.removeSuffix("Z"), compactBootFormat).toInstant(ZoneOffset.UTC) }.getOrNull()
         }
-        return instant != null && instant.epochSecond > 0
+        return instant?.takeIf { it.epochSecond > 0 }
     }
+    fun validBoot(value: String?): Boolean = bootInstant(value) != null
     fun confirm(profile: Profile, confirmation: PowerConfirmation, current: VmDetails, now: Long) {
         require(profile.id == confirmation.profileId && profile.origin() == confirmation.origin) { "Connection changed. Review the action again." }
         require(current.authority == confirmation.details.authority && current.uuid == confirmation.details.uuid) { "VM identity changed." }
@@ -69,9 +78,13 @@ object PowerRules {
         require(eligible(current, confirmation.action)) { "This action is no longer available. Refresh the VM." }
         require(current.power == confirmation.details.power && current.bootTime == confirmation.details.bootTime) { "VM changed. Review the action again." }
     }
-    fun verified(operation: PowerOperation, current: VmDetails): Boolean =
-        operation.authority == current.authority && operation.vmUuid == current.uuid && current.power == operation.action.after &&
-            (operation.action != PowerAction.REBOOT || (validBoot(current.bootTime) && current.bootTime != operation.beforeBoot))
+    fun verified(operation: PowerOperation, current: VmDetails): Boolean {
+        if (operation.authority != current.authority || operation.vmUuid != current.uuid || current.power != operation.action.after) return false
+        if (operation.action != PowerAction.REBOOT) return true
+        val before = bootInstant(operation.beforeBoot) ?: return false
+        val after = bootInstant(current.bootTime) ?: return false
+        return after != before
+    }
 }
 
 interface OperationStore {
@@ -124,7 +137,7 @@ class PowerService(
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
                 // An explicit XAPI rejection before a task ticket is definitive. Anything else is uncertain.
-                val rejected = error is RpcFailure && op.taskRef == null
+                val rejected = error is RpcFailure && error.explicitRejection && op.taskRef == null
                 return@powerConnection save(op.copy(phase = if (rejected) PowerPhase.FAILED else PowerPhase.UNKNOWN,
                     message = if (rejected) "Server rejected the request (${error.code})." else "Result unknown. Check status; do not repeat the action."), changed)
             }

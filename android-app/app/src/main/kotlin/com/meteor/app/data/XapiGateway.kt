@@ -18,11 +18,15 @@ import javax.net.ssl.SSLSocket
 import javax.net.ssl.TrustManager
 import javax.net.ssl.X509TrustManager
 
-data class ServerCertificate(val sha256: String, val subject: String)
+data class ServerCertificate(val sha256: String, val subject: String, val validFrom: Long, val validUntil: Long)
 class CertificateChanged : Exception("The server certificate changed.")
 class GatewayError(val reason: String) : Exception(reason)
 
-object ServerTrust {
+fun interface CertificateInspector {
+    suspend fun inspect(endpoint: String): ServerCertificate
+}
+
+object ServerTrust : CertificateInspector {
     fun fingerprint(certificate: X509Certificate): String =
         MessageDigest.getInstance("SHA-256").digest(certificate.encoded).joinToString("") { "%02x".format(it) }
 
@@ -47,7 +51,7 @@ object ServerTrust {
         return SSLContext.getInstance("TLS").apply { init(null, arrayOf<TrustManager>(manager), SecureRandom()) }
     }
 
-    suspend fun inspect(endpoint: String): ServerCertificate = withContext(Dispatchers.IO) {
+    override suspend fun inspect(endpoint: String): ServerCertificate = withContext(Dispatchers.IO) {
         val address = URI(Endpoints.normalize(endpoint))
         var certificate: X509Certificate? = null
         val context = context(observed = { certificate = it })
@@ -59,26 +63,34 @@ object ServerTrust {
             socket.startHandshake()
         }
         val leaf = certificate ?: throw SSLPeerUnverifiedException("No certificate.")
-        ServerCertificate(fingerprint(leaf), leaf.subjectX500Principal.name)
+        ServerCertificate(fingerprint(leaf), leaf.subjectX500Principal.name, leaf.notBefore.time, leaf.notAfter.time)
     }
 }
 
 interface MeteorGateway : PowerBackend {
     suspend fun inventory(profile: Profile): Inventory
     suspend fun details(profile: Profile, authority: String, uuid: String): VmDetails
+    suspend fun pollDetails(profile: Profile, authority: String, uuid: String, previous: VmDetails): VmDetails =
+        details(profile, authority, uuid)
+    suspend fun metrics(profile: Profile, target: MetricTarget): MetricSnapshot = throw UnsupportedOperationException()
+    suspend fun activity(profile: Profile, authority: String): PoolActivity = throw UnsupportedOperationException()
 }
 
-class XapiGateway : MeteorGateway {
+class XapiGateway(private val clock: () -> Long = System::currentTimeMillis) : MeteorGateway {
     private suspend fun <T> session(profile: Profile, action: suspend XapiSession.() -> T): T = withContext(Dispatchers.IO) {
-        val connection = XapiSession(profile)
+        val connection = XapiSession(profile, clock)
         try { connection.login(); connection.action() } finally { connection.close() }
     }
     override suspend fun inventory(profile: Profile): Inventory = session(profile) { inventory() }
     override suspend fun details(profile: Profile, authority: String, uuid: String): VmDetails = session(profile) { details(authority, uuid) }
+    override suspend fun pollDetails(profile: Profile, authority: String, uuid: String, previous: VmDetails): VmDetails =
+        session(profile) { readDetails(authority, uuid, previous) }
+    override suspend fun metrics(profile: Profile, target: MetricTarget): MetricSnapshot = session(profile) { metrics(target) }
+    override suspend fun activity(profile: Profile, authority: String): PoolActivity = session(profile) { activity(authority) }
     override suspend fun <T> powerConnection(profile: Profile, action: suspend PowerConnection.() -> T): T = session(profile) { action(this) }
 }
 
-private class XapiSession(private val profile: Profile) : PowerConnection {
+private class XapiSession(private val profile: Profile, private val clock: () -> Long) : PowerConnection {
     private val endpoint = Endpoints.normalize(profile.endpoint)
     private val tls = ServerTrust.context(profile.certificateSha256)
     private var session: String? = null
@@ -145,31 +157,72 @@ private class XapiSession(private val profile: Profile) : PowerConnection {
     }
     fun inventory(): Inventory = InventoryMapper.normalize(records("pool"), records("host"), records("host_metrics"),
         records("VM"), records("SR"), System.currentTimeMillis())
+    fun metrics(target: MetricTarget): MetricSnapshot {
+        val type = if (target.kind == MetricKind.VM) "VM" else "host"
+        val reference = if (target.kind == MetricKind.VM) {
+            val (reference, vm) = readVm(target.authority, target.uuid)
+            if (vm.text("power_state") != "Running") return MetricSnapshot(target, clock(), emptyList(), 0,
+                "The VM is not running. Live metrics are unavailable.")
+            reference
+        } else {
+            verifyPool(target.authority)
+            callForText("host.get_by_uuid", listOf(token, target.uuid)).also {
+                require(record("host", it)["uuid"] == target.uuid) { "Host identity changed." }
+            }
+        }
+        val sources = call("$type.get_data_sources", listOf(token, reference)) as? List<*> ?: throw GatewayError("invalid-metrics")
+        val snapshot = MetricMapper.snapshot(target, sources.map(::map), clock())
+        verifyPool(target.authority)
+        return snapshot
+    }
+    private fun <T> section(read: () -> ReadSection<T>): ReadSection<T> = try { read() }
+        catch (error: RpcFailure) {
+            if (error.code == "SESSION_AUTHENTICATION_FAILED") throw error
+            ReadSection(emptyList(), issue = when (error.code) {
+                "MESSAGE_METHOD_UNKNOWN", "NOT_IMPLEMENTED" -> ReadIssue.UNSUPPORTED
+                "RBAC_PERMISSION_DENIED", "PERMISSION_DENIED" -> ReadIssue.FORBIDDEN
+                else -> ReadIssue.TEMPORARY
+            })
+        } catch (_: GatewayError) { ReadSection(emptyList(), issue = ReadIssue.TEMPORARY) }
+        catch (_: IllegalArgumentException) { ReadSection(emptyList(), issue = ReadIssue.TEMPORARY) }
+    fun activity(authority: String): PoolActivity {
+        verifyPool(authority)
+        val tasks = section { ActivityMapper.tasks(records("task")) }
+        val alerts = section { ActivityMapper.alerts(records("message")) }
+        verifyPool(authority)
+        return PoolActivity(authority, clock(), tasks, alerts)
+    }
     private fun verifyPool(authority: String) {
         val pools = records("pool")
         require(pools.size == 1 && pools.values.single()["uuid"] == authority) { "Pool identity changed." }
     }
-    private fun vmRef(authority: String, uuid: String): String {
+    private fun readVm(authority: String, uuid: String): Pair<String, Map<String, Any?>> {
         verifyPool(authority)
         val ref = callForText("VM.get_by_uuid", listOf(token, uuid))
         val vm = record("VM", ref)
         require(vm["uuid"] == uuid && !vm.flag("is_control_domain") && !vm.flag("is_a_template") && !vm.flag("is_a_snapshot")) { "This object cannot be managed as a VM." }
-        return ref
+        return ref to vm
     }
-    override suspend fun details(authority: String, uuid: String): VmDetails {
-        val ref = vmRef(authority, uuid)
-        val vm = record("VM", ref)
+    private fun vmRef(authority: String, uuid: String) = readVm(authority, uuid).first
+    override suspend fun details(authority: String, uuid: String): VmDetails = readDetails(authority, uuid, null)
+    fun readDetails(authority: String, uuid: String, previous: VmDetails?): VmDetails {
+        val vm = readVm(authority, uuid).second
         val power = vm.text("power_state")
+        val now = clock()
+        val topology = VmTopology(profile.origin(), vm.strings("VBDs"), vm.strings("VIFs"))
+        val operations = (vm["current_operations"] as? Map<*, *>)?.isNotEmpty() ?: false
+        val metrics = vm.text("metrics").takeIf { it != "OpaqueRef:NULL" && it.isNotBlank() }?.let { record("VM_metrics", it) }.orEmpty()
+        val boot = metrics.text("start_time").takeIf { it.isNotBlank() }
+        val cached = previous?.takeIf { DetailPolling.canReuseTopology(it, authority, uuid, topology, power, boot, operations, now) }
         val host = vm.text("resident_on").takeIf { power != "Halted" && it != "OpaqueRef:NULL" && it.isNotBlank() }
             ?.let { record("host", it).text("name_label") }
-        val disks = vm.strings("VBDs").map { record("VBD", it) }.filter { it.text("type") == "Disk" && !it.flag("empty") }.map { vbd ->
+        val disks = cached?.disks ?: topology.disks.map { record("VBD", it) }.filter { it.text("type") == "Disk" && !it.flag("empty") }.map { vbd ->
             val disk = record("VDI", vbd.text("VDI"))
             VmDisk(disk.text("name_label").ifBlank { "Disk" }, disk.number("virtual_size"), vbd.text("userdevice"), vbd.flag("currently_attached"), vbd.text("mode") == "RO")
         }
-        val networks = vm.strings("VIFs").map { record("VIF", it) }.map { vif ->
+        val networks = cached?.networks ?: topology.networks.map { record("VIF", it) }.map { vif ->
             VmNetwork(record("network", vif.text("network")).text("name_label"), vif.text("device"), vif.text("MAC"), vif.flag("currently_attached"))
         }
-        val metrics = vm.text("metrics").takeIf { it != "OpaqueRef:NULL" && it.isNotBlank() }?.let { record("VM_metrics", it) }.orEmpty()
         val guest = vm.text("guest_metrics").takeIf { it != "OpaqueRef:NULL" && it.isNotBlank() }?.let { record("VM_guest_metrics", it) }.orEmpty()
         val agentReported = (guest["os_version"] as? Map<*, *>)?.isNotEmpty() == true ||
             (guest["PV_drivers_version"] as? Map<*, *>)?.isNotEmpty() == true
@@ -179,8 +232,8 @@ private class XapiSession(private val profile: Profile) : PowerConnection {
             .filter { it.key.toString().contains("/ip") }.map { it.value.toString() }.filter { it.isNotBlank() }.distinct().sorted() else emptyList()
         return VmDetails(authority, uuid, vm.text("name_label"), vm.text("name_description"), power, host,
             vm.number("VCPUs_max").toInt(), vm.number("memory_static_max"), disks, networks, live, os, addresses,
-            metrics.text("start_time").takeIf { it.isNotBlank() }, vm.strings("allowed_operations").toSet(),
-            (vm["current_operations"] as? Map<*, *>)?.isNotEmpty() ?: false, System.currentTimeMillis())
+            boot, vm.strings("allowed_operations").toSet(), operations, now,
+            cached?.topologyObservedAt ?: now, topology)
     }
     override suspend fun submit(authority: String, uuid: String, action: PowerAction): String {
         val ref = vmRef(authority, uuid)

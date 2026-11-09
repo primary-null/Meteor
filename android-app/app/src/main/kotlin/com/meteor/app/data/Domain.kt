@@ -27,7 +27,10 @@ object Endpoints {
     }
 }
 
-data class Host(val uuid: String, val name: String, val online: Boolean, val totalBytes: Long?, val freeBytes: Long?)
+data class Host(val uuid: String, val name: String, val online: Boolean, val totalBytes: Long?, val freeBytes: Long?,
+    val description: String = "", val softwareVersion: String? = null)
+data class StorageRepository(val uuid: String, val name: String, val type: String, val contentType: String,
+    val totalBytes: Long?, val usedBytes: Long?, val description: String)
 data class Guest(
     val uuid: String, val name: String, val power: String, val poolUuid: String,
     val hostUuid: String?, val vcpus: Int, val memoryBytes: Long,
@@ -37,6 +40,7 @@ data class Guest(
 data class Inventory(
     val authority: String, val poolName: String, val hosts: List<Host>, val guests: List<Guest>,
     val storageTotal: Long, val storageUsed: Long, val observedAtMillis: Long,
+    val repositories: List<StorageRepository> = emptyList(),
 )
 data class VmGroup(val id: String, val name: String, val subtitle: String, val guests: List<Guest>)
 
@@ -59,7 +63,8 @@ object InventoryMapper {
         val byRef = hosts.mapValues { (_, host) ->
             val metrics = hostMetrics[host.text("metrics")].orEmpty()
             Host(host.text("uuid").also { require(it.isNotBlank()) { "Missing host identity." } }, host.text("name_label").ifBlank { "Unnamed host" },
-                metrics.flag("live"), metrics.number("memory_total"), metrics.number("memory_free"))
+                metrics.flag("live"), metrics.number("memory_total"), metrics.number("memory_free"), host.text("name_description"),
+                (host["software_version"] as? Map<*, *>)?.get("product_version")?.toString()?.takeIf { it.isNotBlank() })
         }
         require(byRef.values.map { it.uuid }.distinct().size == byRef.size) { "Duplicate host identity." }
         val guests = vms.values.filterNot { it.flag("is_a_template") || it.flag("is_control_domain") || it.flag("is_a_snapshot") }
@@ -71,10 +76,16 @@ object InventoryMapper {
             }.sortedBy { it.name.lowercase() }
         require(guests.map { it.uuid }.distinct().size == guests.size) { "Duplicate VM identity." }
         val diskRepositories = storage.values.filter { it.text("content_type") != "iso" && (it.number("physical_size") ?: 0) > 0 }
+        val repositories = storage.values.map { sr ->
+            StorageRepository(sr.text("uuid").also { require(it.isNotBlank()) { "Missing storage identity." } },
+                sr.text("name_label").ifBlank { "Storage repository" }, sr.text("type"), sr.text("content_type"),
+                sr.number("physical_size")?.takeIf { it >= 0 }, sr.number("physical_utilisation")?.takeIf { it >= 0 }, sr.text("name_description"))
+        }.sortedBy { it.name.lowercase() }
+        require(repositories.map { it.uuid }.distinct().size == repositories.size) { "Duplicate storage identity." }
         return Inventory(authority, pool.text("name_label").ifBlank { "XCP-ng pool" },
             byRef.values.sortedBy { it.name.lowercase() }, guests,
             diskRepositories.sumOf { it.number("physical_size") ?: 0 },
-            diskRepositories.sumOf { it.number("physical_utilisation") ?: 0 }, nowMillis)
+            diskRepositories.sumOf { it.number("physical_utilisation") ?: 0 }, nowMillis, repositories)
     }
 
     fun groups(inventory: Inventory): List<VmGroup> {

@@ -28,11 +28,17 @@ data class ProfileDocument(val profiles: List<Profile> = emptyList(), val select
     }
 }
 
+interface ProfileStorage {
+    suspend fun load(): ProfileDocument
+    suspend fun save(document: ProfileDocument)
+    suspend fun importDebugBootstrap(context: Context): Boolean = false
+}
+
 class ProfileVault(
     context: Context,
     fileName: String = "profiles.secured",
     private val alias: String = "meteor.profiles.v1",
-) {
+) : ProfileStorage {
     init { require(fileName.matches(Regex("[A-Za-z0-9._-]+"))) }
     private val file = AtomicFile(File(context.filesDir, fileName))
     private val aad = "Meteor.profile.v1".toByteArray()
@@ -56,7 +62,7 @@ class ProfileVault(
         .put("endpoint", profile.endpoint).put("username", profile.username)
         .put("password", profile.password).put("certificateSha256", profile.certificateSha256)
 
-    suspend fun load(): ProfileDocument = withContext(Dispatchers.IO) {
+    override suspend fun load(): ProfileDocument = withContext(Dispatchers.IO) {
         if (!file.baseFile.exists() && !File(file.baseFile.path + ".bak").exists()) return@withContext ProfileDocument()
         val encoded = file.openRead().use { stream ->
             val output = ByteArrayOutputStream()
@@ -87,7 +93,7 @@ class ProfileVault(
         })
     }
 
-    suspend fun save(document: ProfileDocument) = withContext(Dispatchers.IO) {
+    override suspend fun save(document: ProfileDocument) = withContext(Dispatchers.IO) {
         require(document.profiles.size <= 50)
         val root = JSONObject().put("version", 1).put("selectedId", document.selectedId.orEmpty())
             .put("profiles", JSONArray().apply { document.profiles.forEach { put(json(it)) } })
@@ -103,7 +109,7 @@ class ProfileVault(
         catch (error: Exception) { file.failWrite(stream); throw error }
     }
 
-    suspend fun importDebugBootstrap(context: Context): Boolean = withContext(Dispatchers.IO) {
+    override suspend fun importDebugBootstrap(context: Context): Boolean = withContext(Dispatchers.IO) {
         if (!BuildConfig.DEBUG) return@withContext false
         val source = File(context.filesDir, "bootstrap.json")
         if (!source.exists()) return@withContext false

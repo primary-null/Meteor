@@ -4,15 +4,19 @@ import android.graphics.BitmapFactory
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.isSystemInDarkTheme
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.text.selection.SelectionContainer
+import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
@@ -29,8 +33,12 @@ import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.painterResource
 import androidx.compose.ui.platform.LocalView
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.platform.LocalSoftwareKeyboardController
+import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.input.PasswordVisualTransformation
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.lifecycle.Lifecycle
@@ -44,9 +52,6 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import java.text.DateFormat
 import java.util.Date
-
-private val taglines = listOf("Keep every spark in sight.", "Your universe. Under control.",
-    "From a spark to a system.", "Small sparks. Stellar possibilities.")
 
 @Composable
 fun MeteorApp(model: MeteorViewModel) {
@@ -81,19 +86,22 @@ fun MeteorApp(model: MeteorViewModel) {
     }
     MaterialTheme(colorScheme = colors) {
         var page by rememberSaveable { mutableIntStateOf(0) }
-        var paused by rememberSaveable { mutableStateOf(false) }
-        var tagline by rememberSaveable { mutableIntStateOf(0) }
         var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
+        LaunchedEffect(state.inventory?.observedAtMillis, state.metricSamples.lastOrNull()?.observedAt, state.poolActivity?.observedAt) {
+            // A receipt can arrive between five-second ticks; compare it with the current clock immediately.
+            now = System.currentTimeMillis()
+        }
         val owner = LocalLifecycleOwner.current
-        LaunchedEffect(owner, paused) {
+        LaunchedEffect(owner, page) {
             owner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
                 var elapsed = 0
                 while (true) {
                     now = System.currentTimeMillis()
                     if (elapsed % 30 == 0) model.refreshIfStale()
                     if (elapsed % 5 == 0) model.refreshDetails()
-                    if (!paused && elapsed > 0 && elapsed % 8 == 0) tagline = (tagline + 1) % taglines.size
-                    delay(1000); elapsed++
+                    if (page == 5) model.refreshMetrics()
+                    if (page == 6 && elapsed % 15 == 0) model.refreshActivity()
+                    delay(5000); elapsed += 5
                 }
             }
         }
@@ -101,13 +109,19 @@ fun MeteorApp(model: MeteorViewModel) {
         Scaffold(containerColor = colors.background, bottomBar = {
             NavigationBar(containerColor = colors.surface) {
                 listOf("Overview", "VMs", "Connect", "Settings").forEachIndexed { index, label ->
-                    NavigationBarItem(selected = page == index, onClick = { page = index },
+                    val parent = when (page) {
+                        4 -> 3
+                        5 -> if (state.metricTarget?.kind == MetricKind.VM) 1 else 0
+                        6 -> 0
+                        else -> page
+                    }
+                    NavigationBarItem(selected = parent == index, onClick = { page = index },
                         icon = { SpaceIcon(listOf("planet", "meteor", "orbit", "spark")[index], Modifier.size(23.dp)) },
                         label = { Text(label) })
                 }
             }
         }) { insets ->
-            Box(Modifier.fillMaxSize().padding(insets)) {
+            Box(Modifier.fillMaxSize().padding(insets).consumeWindowInsets(insets).imePadding()) {
                 if (state.appearance.texture) Canvas(Modifier.fillMaxSize().alpha(if (dark) .12f else .07f)) {
                     val ink = accent
                     repeat(64) { index ->
@@ -126,53 +140,71 @@ fun MeteorApp(model: MeteorViewModel) {
                             Text("meteor", fontSize = 28.sp, fontWeight = FontWeight.SemiBold, letterSpacing = (-1).sp)
                             Text("SPARK  /  XCP-ng", style = MaterialTheme.typography.labelSmall, color = colors.primary)
                         }
-                        if (state.selectedProfile != null) TextButton(onClick = model::refresh, enabled = !state.loading) { Text("Refresh") }
+                        if (state.selectedProfile != null) TextButton(onClick = model::refresh,
+                            enabled = !state.loading && !state.profileBusy && !state.operationBusy && state.editingProfileId == null && state.pendingTrust == null) { Text("Refresh") }
                     }
-                    Row(Modifier.padding(horizontal = 22.dp).fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-                        Text(taglines[tagline], style = MaterialTheme.typography.bodySmall, color = colors.onSurfaceVariant, modifier = Modifier.weight(1f))
-                        TextButton(onClick = { paused = !paused }, contentPadding = PaddingValues(4.dp)) { Text(if (paused) "Resume" else "Pause", style = MaterialTheme.typography.labelSmall) }
-                    }
-                    if (state.loading) LinearProgressIndicator(Modifier.fillMaxWidth())
-                    state.message?.let { message ->
-                        Surface(color = colors.errorContainer, modifier = Modifier.padding(horizontal = 16.dp, vertical = 4.dp), shape = RoundedCornerShape(12.dp)) {
-                            Column(Modifier.padding(12.dp)) { Text(message, style = MaterialTheme.typography.bodySmall); TextButton(onClick = model::dismissMessage) { Text("Dismiss") } }
-                        }
-                    }
+                    AmbientMessage(canRotate = page == 0 &&
+                        !state.operationBusy && state.operation?.unresolved != true && state.message == null &&
+                        state.pendingTrust == null && state.editingProfileId == null && state.selectedGuest == null &&
+                        state.pendingPower == null && state.pendingReview == null,
+                        modifier = Modifier.fillMaxWidth().padding(start = 22.dp, end = 22.dp, top = 2.dp, bottom = 14.dp))
+                    HorizontalDivider(color = colors.outlineVariant.copy(alpha = .35f))
+                    if (state.loading || state.profileBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
+                    state.notice?.let { NoticeBanner(it, model::dismissMessage) }
                     state.operation?.let { operation ->
                         Surface(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), color = colors.surfaceContainer, shape = RoundedCornerShape(12.dp)) {
                             Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                                 Text("${operation.vmName} · ${operation.action.title}", style = MaterialTheme.typography.labelMedium)
-                                Text(operation.message.ifBlank { operation.phase.name }, style = MaterialTheme.typography.bodySmall)
-                                if (operation.unresolved && !state.operationBusy) TextButton(onClick = model::checkOperation) { Text("Check status") }
+                                Text(if (operation.unresolved) operation.message.ifBlank { operation.phase.name } else OperationHistory.status(operation),
+                                    style = MaterialTheme.typography.bodySmall)
+                                TextButton(onClick = { page = 4; model.reloadHistory() }) { Text("View history") }
+                                if (operation.unresolved && !state.operationBusy) TextButton(onClick = model::checkOperation, enabled = !state.profileBusy) { Text("Check status") }
                                 if (operation.unresolved) {
                                     TextButton(onClick = model::reviewOperation,
-                                        enabled = state.connected && !state.loading && !state.operationBusy && !state.journalProblem) { Text("Review pending action") }
+                                        enabled = state.connected && !state.loading && !state.profileBusy && !state.operationBusy && !state.journalProblem) { Text("Review pending action") }
                                 }
                             }
                         }
                     }
                     when (page) {
-                        0 -> Overview(state, now) { page = 2 }
+                        0 -> Overview(state, now, { page = 2 }, { target -> model.openMetrics(target); page = 5 }, { page = 6; model.refreshActivity() })
                         1 -> VmList(state, model, model::openDetails)
                         2 -> Connections(state, model)
-                        else -> Settings(state.appearance, model)
+                        3 -> Settings(state.appearance, model) { page = 4; model.reloadHistory() }
+                        5 -> PerformanceScreen(state, now, model::refreshMetrics) { page = if (state.metricTarget?.kind == MetricKind.VM) 1 else 0 }
+                        6 -> PoolActivityScreen(state, now, model::refreshActivity) { page = 0 }
+                        else -> HistoryScreen(state, model::reloadHistory, { page = 3 }, { page = 0 })
                     }
                 }
             }
         }
         state.pendingTrust?.let { pending ->
+            var verified by remember(pending) { mutableStateOf(false) }
             AlertDialog(onDismissRequest = model::cancelTrust, title = { Text("Verify this server") }, text = {
-                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
                     Text("Compare this SHA-256 fingerprint with a trusted source for your XCP-ng server. Credentials are sent only after you accept.")
                     Text(pending.profile.endpoint, style = MaterialTheme.typography.bodySmall)
-                    Text(pending.certificate.sha256.chunked(2).joinToString(":"), style = MaterialTheme.typography.bodySmall)
+                    Text(pending.certificate.subject, style = MaterialTheme.typography.bodySmall)
+                    Text("Valid from ${DateFormat.getDateInstance().format(Date(pending.certificate.validFrom))}\nExpires ${DateFormat.getDateInstance().format(Date(pending.certificate.validUntil))}", style = MaterialTheme.typography.bodySmall)
+                    Fingerprint("Observed SHA-256", pending.certificate.sha256)
+                    pending.previous?.let { previous ->
+                        if (previous.endpoint != pending.profile.endpoint || previous.certificateSha256 != pending.certificate.sha256) {
+                            Text("This replaces the saved server identity. Verify the change independently before accepting.")
+                            Text("Previously saved: ${previous.endpoint}", style = MaterialTheme.typography.bodySmall)
+                            Fingerprint("Saved SHA-256", previous.certificateSha256)
+                        } else Text("The observed certificate matches the saved pin.", style = MaterialTheme.typography.bodySmall)
+                    }
                     Text("Accepting pins this certificate for future connections.", style = MaterialTheme.typography.bodySmall)
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        Checkbox(verified, { verified = it })
+                        Text("I compared the fingerprint with a trusted source.", style = MaterialTheme.typography.bodySmall)
+                    }
                 }
-            }, confirmButton = { TextButton(onClick = model::acceptTrust) { Text("Trust and connect") } },
+            }, confirmButton = { TextButton(onClick = model::acceptTrust, enabled = verified && !state.profileBusy && !state.operationBusy) { Text("Trust and connect") } },
                 dismissButton = { TextButton(onClick = model::cancelTrust) { Text("Cancel") } })
         }
         state.selectedGuest?.let { guest ->
-            GuestDialog(guest, state, model, model::closeDetails)
+            GuestDialog(guest, state, model, { model.openMetrics(MetricTarget(guest.poolUuid, guest.uuid, MetricKind.VM, guest.name)); page = 5 }, model::closeDetails)
         }
         state.pendingPower?.let { confirmation ->
             AlertDialog(onDismissRequest = model::cancelPower, title = { Text("${confirmation.action.title} ${confirmation.details.name}?") }, text = {
@@ -213,9 +245,11 @@ fun MeteorApp(model: MeteorViewModel) {
     }
 }
 
-@Composable private fun Overview(state: MeteorState, now: Long, connect: () -> Unit) {
+@Composable private fun Overview(state: MeteorState, now: Long, connect: () -> Unit, metrics: (MetricTarget) -> Unit, activity: () -> Unit) {
     val inventory = state.inventory
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+    var hostId by remember(inventory?.authority) { mutableStateOf<String?>(null) }
+    var showStorage by remember(inventory?.authority) { mutableStateOf(false) }
+    LazyColumn(Modifier.fillMaxSize().testTag("overview-list"), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { PageTitle("Your universe", state.selectedProfile?.label ?: "A clear view of every spark.") }
         if (inventory == null) item {
             Panel {
@@ -225,11 +259,18 @@ fun MeteorApp(model: MeteorViewModel) {
                 Button(onClick = connect) { Text("Add connection") }
             }
         } else {
-            val fresh = state.connected && now - inventory.observedAtMillis < 45_000
+            val fresh = state.connected && now - inventory.observedAtMillis in 0..45_000
             item {
                 Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Text(if (fresh) "● Connected" else "○ Last known", color = MaterialTheme.colorScheme.primary, style = MaterialTheme.typography.labelMedium)
-                    Text(DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(inventory.observedAtMillis)), style = MaterialTheme.typography.labelMedium)
+                    Surface(color = if (fresh) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceContainerHigh,
+                        shape = RoundedCornerShape(50)) {
+                        Text(if (state.loading) "Refreshing…" else if (fresh) "● Connected" else "○ Last known",
+                            modifier = Modifier.padding(horizontal = 10.dp, vertical = 5.dp),
+                            color = if (fresh) MaterialTheme.colorScheme.onPrimaryContainer else MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.labelMedium)
+                    }
+                    Text("Updated ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(inventory.observedAtMillis))}",
+                        style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
             }
             item {
@@ -246,19 +287,31 @@ fun MeteorApp(model: MeteorViewModel) {
                     val free = inventory.hosts.sumOf { it.freeBytes ?: 0 }
                     Capacity("Host memory", if (complete && total > 0) total - free else null, if (complete) total else null)
                     Capacity("Storage repositories", inventory.storageUsed.takeIf { inventory.storageTotal > 0 }, inventory.storageTotal.takeIf { it > 0 })
+                    TextButton(onClick = { showStorage = true }) { Text("Storage details") }
                 }
             }
             item { Text("CONSTELLATION", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary) }
-            item { Panel { Text(inventory.poolName, style = MaterialTheme.typography.titleLarge); Text("Pool · ${inventory.hosts.size} ${if (inventory.hosts.size == 1) "host" else "hosts"} · ${inventory.guests.size} ${if (inventory.guests.size == 1) "VM" else "VMs"}", style = MaterialTheme.typography.bodySmall) } }
+            item { Panel {
+                Text(inventory.poolName, style = MaterialTheme.typography.titleLarge)
+                Text("Pool · ${inventory.hosts.size} ${if (inventory.hosts.size == 1) "host" else "hosts"} · ${inventory.guests.size} ${if (inventory.guests.size == 1) "VM" else "VMs"}", style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = activity, enabled = state.connected) { Text("Pool activity") }
+            } }
             items(inventory.hosts, key = { it.uuid }) { host ->
                 Panel {
                     Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                         SpaceIcon("planet", Modifier.size(40.dp)); Column { Text(host.name, fontWeight = FontWeight.Medium); Text(if (host.online) "Host online" else "Host offline", style = MaterialTheme.typography.bodySmall) }
                     }
+                    TextButton(onClick = { hostId = host.uuid }) { Text("Host details") }
+                    OutlinedButton(onClick = { metrics(MetricTarget(inventory.authority, host.uuid, MetricKind.HOST, host.name)) },
+                        enabled = state.connected && host.online) { Text("Host performance") }
                 }
             }
             item { Text("Inventory refreshes while Meteor is visible. Open a VM for details and available power actions.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
         }
+    }
+    if (inventory != null) {
+        inventory.hosts.firstOrNull { it.uuid == hostId }?.let { HostDetails(it, inventory, state.connected) { hostId = null } }
+        if (showStorage) StorageDetails(inventory, state.connected) { showStorage = false }
     }
 }
 
@@ -283,24 +336,39 @@ fun MeteorApp(model: MeteorViewModel) {
 }
 
 @Composable private fun Panel(content: @Composable ColumnScope.() -> Unit) {
-    Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface, modifier = Modifier.fillMaxWidth()) {
+    Surface(shape = RoundedCornerShape(20.dp), color = MaterialTheme.colorScheme.surface,
+        border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant.copy(alpha = .35f)), modifier = Modifier.fillMaxWidth()) {
         Column(Modifier.padding(18.dp), verticalArrangement = Arrangement.spacedBy(12.dp), content = content)
     }
 }
 
 @Composable private fun VmList(state: MeteorState, model: MeteorViewModel, select: (Guest) -> Unit) {
     var search by rememberSaveable { mutableStateOf("") }
+    var filter by rememberSaveable { mutableStateOf(FleetFilter.ALL) }
     val inventory = state.inventory
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+    val filtered = remember(inventory, search, filter) { inventory?.filterFleet(search, filter) }
+    LazyColumn(Modifier.fillMaxSize().testTag("fleet-list"), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
         item { PageTitle("The fleet", "Pools → hosts → virtual machines") }
         item { OutlinedTextField(search, { search = it }, label = { Text("Find a VM") }, singleLine = true, modifier = Modifier.fillMaxWidth()) }
+        item {
+            FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                FleetFilter.entries.forEach { choice ->
+                    FilterChip(selected = filter == choice, onClick = { filter = choice }, label = { Text(choice.title) })
+                }
+            }
+        }
         if (inventory == null) item { Text("Connect to a server to see your fleet.") }
         else {
-            item { Text(inventory.poolName, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold) }
-            val groups = InventoryMapper.groups(inventory)
+            val matches = requireNotNull(filtered)
+            item {
+                Text(inventory.poolName, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
+                Text("${matches.guests.size} of ${inventory.guests.size} VMs · Search by VM or host name",
+                    style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            val groups = InventoryMapper.groups(matches)
             groups.forEach { group ->
-                val guests = group.guests.filter { it.name.contains(search, ignoreCase = true) }
-                if (guests.isNotEmpty() || search.isBlank()) {
+                val guests = group.guests
+                if (guests.isNotEmpty() || (search.isBlank() && filter == FleetFilter.ALL)) {
                     item(key = "group:${group.id}") {
                         Row(Modifier.padding(top = 8.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(10.dp)) {
                             SpaceIcon("planet", Modifier.size(28.dp)); Column { Text(group.name, fontWeight = FontWeight.Medium); Text(group.subtitle, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
@@ -318,7 +386,11 @@ fun MeteorApp(model: MeteorViewModel) {
                     }
                 }
             }
-            if (inventory.guests.none { it.name.contains(search, true) }) item { Text(if (search.isBlank()) "This pool has no VMs." else "No matching VMs.") }
+            if (matches.guests.isEmpty()) item {
+                Text(if (inventory.guests.isEmpty()) "This pool has no VMs." else "No VMs match this search and state filter.")
+                if (search.isNotBlank() || filter != FleetFilter.ALL)
+                    TextButton(onClick = { search = ""; filter = FleetFilter.ALL }) { Text("Clear filters") }
+            }
         }
     }
 }
@@ -334,7 +406,7 @@ fun MeteorApp(model: MeteorViewModel) {
     else SpaceIcon(token, modifier)
 }
 
-@Composable private fun GuestDialog(guest: Guest, state: MeteorState, model: MeteorViewModel, dismiss: () -> Unit) {
+@Composable private fun GuestDialog(guest: Guest, state: MeteorState, model: MeteorViewModel, performance: () -> Unit, dismiss: () -> Unit) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) model.importIcon(guest, uri) }
     var showAddresses by remember(guest.uuid) { mutableStateOf(false) }
     AlertDialog(onDismissRequest = dismiss, title = { Text(guest.name) }, text = {
@@ -342,6 +414,7 @@ fun MeteorApp(model: MeteorViewModel) {
             val detail = state.details?.takeIf { it.uuid == guest.uuid && it.authority == guest.poolUuid }
             if (state.detailsBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
             Text("${detail?.power ?: guest.power} · ${detail?.vcpus ?: guest.vcpus} vCPU · ${bytes(detail?.memoryBytes ?: guest.memoryBytes)}")
+            OutlinedButton(onClick = performance, enabled = state.connected && !state.profileBusy && !state.operationBusy) { Text("VM performance") }
             if (detail != null) {
                 Text("Host: ${detail.host ?: if (detail.power == "Halted") "Unassigned" else "Unknown"}", style = MaterialTheme.typography.bodySmall)
                 Text(if (detail.guestToolsLive) "Guest tools reporting${detail.os?.let { " · $it" }.orEmpty()}" else "Guest tools not reporting", style = MaterialTheme.typography.bodySmall)
@@ -351,6 +424,8 @@ fun MeteorApp(model: MeteorViewModel) {
                     if (showAddresses) Text(detail.addresses.joinToString("\n"), style = MaterialTheme.typography.bodySmall)
                 }
                 Text("Disks", fontWeight = FontWeight.Medium)
+                Text("Disk/network snapshot: ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(detail.topologyObservedAt))}. Refresh details to reload it.",
+                    style = MaterialTheme.typography.bodySmall)
                 if (detail.disks.isEmpty()) Text("No virtual disks", style = MaterialTheme.typography.bodySmall)
                 detail.disks.forEach { disk -> Text("${disk.name} · ${bytes(disk.size)}\nDevice ${disk.device} · ${if (disk.attached) "Attached" else "Detached"}${if (disk.readOnly) " · Read-only" else ""}", style = MaterialTheme.typography.bodySmall) }
                 Text("Network interfaces", fontWeight = FontWeight.Medium)
@@ -359,10 +434,13 @@ fun MeteorApp(model: MeteorViewModel) {
                 Text("Power", fontWeight = FontWeight.Medium)
                 PowerAction.entries.forEach { action ->
                     OutlinedButton(onClick = { model.requestPower(action) }, modifier = Modifier.fillMaxWidth(),
-                        enabled = state.connected && !state.loading && !state.detailsBusy && !state.journalProblem && !state.operationBusy &&
+                        enabled = state.connected && !state.loading && !state.profileBusy && !state.detailsBusy && !state.journalProblem && !state.operationBusy &&
                             state.operation?.unresolved != true && PowerRules.eligible(detail, action)) { Text(action.title) }
+                    PowerRules.unavailableReason(detail, action)?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
                 }
                 if (state.operation?.unresolved == true) Text("A pending operation must be reconciled before another action.", style = MaterialTheme.typography.bodySmall)
+                else if (state.journalProblem) Text("Operation history must be readable before a power action can be sent.", style = MaterialTheme.typography.bodySmall)
+                else if (!state.connected) Text("Reconnect before choosing a power action.", style = MaterialTheme.typography.bodySmall)
                 Text("Availability comes from the server's current VM operations. Graceful actions may require working guest tools.", style = MaterialTheme.typography.bodySmall)
             }
             if (detail == null && !state.detailsBusy) Text("Details are unavailable. Load them again when connected.", style = MaterialTheme.typography.bodySmall)
@@ -385,35 +463,110 @@ fun MeteorApp(model: MeteorViewModel) {
 }
 
 @Composable private fun Connections(state: MeteorState, model: MeteorViewModel) {
-    var label by rememberSaveable { mutableStateOf("") }
-    var endpoint by rememberSaveable { mutableStateOf("") }
-    var username by rememberSaveable { mutableStateOf("") }
-    var password by remember { mutableStateOf("") }
-    LaunchedEffect(state.manualConnectionEvent) { if (state.manualConnectionEvent > 0) password = "" }
-    LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
+    var forgetId by rememberSaveable { mutableStateOf<String?>(null) }
+    var certificateId by rememberSaveable { mutableStateOf<String?>(null) }
+    val editable = !state.loading && !state.profileBusy && !state.operationBusy && state.pendingTrust == null
+    val editorKey = "editor:${state.editingProfileId ?: "new"}:${state.profileEditSession}"
+    val listState = rememberLazyListState()
+    LaunchedEffect(state.editingProfileId) { if (state.editingProfileId != null) listState.animateScrollToItem(1) }
+    LazyColumn(Modifier.fillMaxSize().testTag("connections-list"), state = listState, contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { PageTitle("Connections", "Direct XAPI · HTTPS · certificate pinning") }
-        items(state.profiles, key = { it.id }) { profile ->
-            Panel { Text(profile.label, style = MaterialTheme.typography.titleMedium); Text("Connection profile", style = MaterialTheme.typography.bodySmall)
-                OutlinedButton(onClick = { model.switchProfile(profile) }, enabled = !state.loading) { Text(if (profile.id == state.selectedId) "Reconnect" else "Connect") } }
-        }
-        item {
+        if (state.editingProfileId != null) item(key = editorKey) { ConnectionForm(state, model) }
+        if (state.selectedProfile != null || state.loading) item {
             Panel {
-                Text("Add XCP-ng server", style = MaterialTheme.typography.titleLarge)
-                OutlinedTextField(label, { label = it }, label = { Text("Connection name") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(endpoint, { endpoint = it }, label = { Text("Server address") }, placeholder = { Text("https://your-server") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(username, { username = it }, label = { Text("Username") }, singleLine = true, modifier = Modifier.fillMaxWidth())
-                OutlinedTextField(password, { password = it }, label = { Text("Password") }, singleLine = true, visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
-                Button(onClick = { model.inspect(label, endpoint, username, password) }, enabled = !state.loading && endpoint.isNotBlank() && username.isNotBlank() && password.isNotBlank()) { Text("Review certificate") }
-                Text("Credentials are encrypted with Android Keystore after a successful connection. Use your private network or VPN.", style = MaterialTheme.typography.bodySmall)
+                Text(state.selectedProfile?.label ?: "Connecting", style = MaterialTheme.typography.titleMedium)
+                Text(if (state.connected) "Connected" else if (state.loading) "Connecting…" else "Last connection unavailable", style = MaterialTheme.typography.bodySmall)
+                OutlinedButton(onClick = model::disconnect, enabled = !state.profileBusy && !state.operationBusy) { Text("Disconnect") }
+                Text("Disconnect stops refreshes and clears the active selection. Saved profiles and operation history are kept.", style = MaterialTheme.typography.bodySmall)
             }
         }
+        items(state.profiles, key = { it.id }) { profile ->
+            val pending = state.operation?.let { it.unresolved && it.profileId == profile.id } == true
+            Panel {
+                Text(profile.label, style = MaterialTheme.typography.titleMedium)
+                Text("${profile.endpoint}\n${profile.username}", style = MaterialTheme.typography.bodySmall)
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    OutlinedButton(onClick = { model.switchProfile(profile) }, enabled = editable) { Text(if (profile.id == state.selectedId) "Reconnect" else "Connect") }
+                    OutlinedButton(onClick = { model.editProfile(profile.id) }, enabled = editable) { Text("Edit") }
+                }
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    TextButton(onClick = { certificateId = profile.id }) { Text("Certificate") }
+                    TextButton(onClick = { forgetId = profile.id }, enabled = editable && !state.journalProblem && !pending) { Text("Forget") }
+                }
+                if (pending) Text("Resolve this connection's pending action before forgetting it. You can still edit credentials or review a renewed certificate.", style = MaterialTheme.typography.bodySmall)
+                else if (state.journalProblem) Text("Forgetting is unavailable until operation history can be read.", style = MaterialTheme.typography.bodySmall)
+            }
+        }
+        if (state.editingProfileId == null) item(key = editorKey) { ConnectionForm(state, model) }
         item { Text("Connect to the XCP-ng pool coordinator using direct XAPI.", style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+    }
+    state.profiles.firstOrNull { it.id == certificateId }?.let { profile ->
+        AlertDialog(onDismissRequest = { certificateId = null }, title = { Text("Saved server certificate") }, text = {
+            Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                Text(profile.label)
+                Text(profile.endpoint, style = MaterialTheme.typography.bodySmall)
+                Fingerprint("Saved SHA-256", profile.certificateSha256)
+                Text("To see the current certificate and its expiry, edit this connection and choose Review server certificate. A changed certificate always needs independent verification.", style = MaterialTheme.typography.bodySmall)
+            }
+        }, confirmButton = { TextButton(onClick = { certificateId = null }) { Text("Done") } })
+    }
+    state.profiles.firstOrNull { it.id == forgetId }?.let { profile ->
+        AlertDialog(onDismissRequest = { forgetId = null }, title = { Text("Forget ${profile.label}?") }, text = {
+            Text("Remove this saved connection and its credentials from Meteor on this device. Operation history is kept. This does not revoke the credentials on the server.")
+        }, confirmButton = { TextButton(onClick = { model.forgetProfile(profile.id); forgetId = null }, enabled = editable) { Text("Forget connection") } },
+            dismissButton = { TextButton(onClick = { forgetId = null }) { Text("Cancel") } })
     }
 }
 
-@Composable private fun Settings(appearance: Appearance, model: MeteorViewModel) {
+@Composable private fun Fingerprint(label: String, value: String) {
+    Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium)
+        SelectionContainer { Text(value.chunked(2).joinToString(":"), style = MaterialTheme.typography.bodySmall) }
+    }
+}
+
+@Composable private fun ConnectionForm(state: MeteorState, model: MeteorViewModel) {
+    val focus = LocalFocusManager.current
+    val keyboard = LocalSoftwareKeyboardController.current
+    fun submit(action: () -> Unit) { focus.clearFocus(); keyboard?.hide(); action() }
+    val editing = state.profiles.firstOrNull { it.id == state.editingProfileId }
+    val key = "${editing?.id ?: "new"}:${state.profileEditSession}"
+    var label by rememberSaveable(key) { mutableStateOf(editing?.label.orEmpty()) }
+    var endpoint by rememberSaveable(key) { mutableStateOf(editing?.endpoint.orEmpty()) }
+    var username by rememberSaveable(key) { mutableStateOf(editing?.username.orEmpty()) }
+    // Password drafts never enter saved instance state, including during activity recreation.
+    var password by remember(key) { mutableStateOf("") }
+    LaunchedEffect(state.manualConnectionEvent) { if (state.manualConnectionEvent > 0) password = "" }
+    val enabled = !state.loading && !state.profileBusy && !state.operationBusy && state.pendingTrust == null
+    val valid = enabled && endpoint.isNotBlank() && username.isNotBlank() && (editing != null || password.isNotBlank())
+    Panel {
+        Text(if (editing == null) "Add XCP-ng server" else "Edit connection", style = MaterialTheme.typography.titleLarge)
+        OutlinedTextField(label, { label = it }, label = { Text("Connection name") }, enabled = enabled, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(endpoint, { endpoint = it }, label = { Text("Server address") }, placeholder = { Text("https://your-server") }, enabled = enabled, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(username, { username = it }, label = { Text("Username") }, enabled = enabled, singleLine = true, modifier = Modifier.fillMaxWidth())
+        OutlinedTextField(password, { password = it }, label = { Text(if (editing == null) "Password" else "New password") }, enabled = enabled, singleLine = true,
+            keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Password, autoCorrectEnabled = false),
+            visualTransformation = PasswordVisualTransformation(), modifier = Modifier.fillMaxWidth())
+        if (editing != null) {
+            Text("Leave the new password empty to keep the saved password. Changing credentials keeps the saved certificate pin; a different server requires certificate review.", style = MaterialTheme.typography.bodySmall)
+            Button(onClick = { submit { model.saveConnection(label, endpoint, username, password, editing.id) } }, enabled = valid) { Text("Save changes") }
+            OutlinedButton(onClick = { submit { model.inspect(label, endpoint, username, password, editing.id) } }, enabled = valid) { Text("Review server certificate") }
+            TextButton(onClick = { submit(model::cancelEdit) }, enabled = !state.profileBusy && !state.operationBusy) { Text("Cancel editing") }
+            if (state.operation?.let { it.unresolved && it.profileId == editing.id } == true)
+                Text("Pending actions retain their original connection identity. Changing the server, username or certificate requires manual review of the pending action.", style = MaterialTheme.typography.bodySmall)
+        } else Button(onClick = { submit { model.inspect(label, endpoint, username, password) } }, enabled = valid) { Text("Review certificate") }
+        Text("Credentials are encrypted with Android Keystore after a successful connection. Use your private network or VPN.", style = MaterialTheme.typography.bodySmall)
+    }
+}
+
+@Composable private fun Settings(appearance: Appearance, model: MeteorViewModel, history: () -> Unit) {
     LazyColumn(Modifier.fillMaxSize(), contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(16.dp)) {
         item { PageTitle("Make it yours", "One universe. Your atmosphere.") }
+        item { Panel {
+            Text("Activity", style = MaterialTheme.typography.titleMedium)
+            Text("Review verified, failed and unresolved power actions saved on this device.", style = MaterialTheme.typography.bodySmall)
+            OutlinedButton(onClick = history) { Text("Action history") }
+        } }
         item { Panel {
             Text("Appearance", style = MaterialTheme.typography.titleMedium)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) { listOf("light", "dark", "system").forEach { mode ->
@@ -444,7 +597,7 @@ fun MeteorApp(model: MeteorViewModel) {
     }
 }
 
-private fun bytes(value: Long): String = when {
+internal fun bytes(value: Long): String = when {
     value >= 1L shl 40 -> "%.1f TiB".format(value / (1L shl 40).toDouble())
     value >= 1L shl 30 -> "%.1f GiB".format(value / (1L shl 30).toDouble())
     else -> "%.0f MiB".format(value / (1L shl 20).toDouble())

@@ -46,6 +46,24 @@ class TransportTest {
         assertThrows(IllegalArgumentException::class.java) { XmlRpc.response(envelope(nested)) }
         assertThrows(IllegalArgumentException::class.java) { XmlRpc.response(envelope("<boolean>2</boolean>")) }
     }
+    @Test fun malformedStatusesCannotPretendToBeDefinitiveRejections() {
+        val success = envelope("ok")
+        for (status in listOf("", "Pending", "Failure")) {
+            assertThrows(IllegalArgumentException::class.java) {
+                XmlRpc.response(success.replace("<value>Success</value>", "<value>$status</value>"))
+            }
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            XmlRpc.response(success.replace("<member><name>Value</name><value>ok</value></member>", ""))
+        }
+    }
+    @Test fun genericRpcFaultDoesNotProveXapiRejectedAnAction() {
+        val error = assertThrows(RpcFailure::class.java) {
+            XmlRpc.response("<methodResponse><fault><value>unavailable</value></fault></methodResponse>")
+        }
+        assertEquals("RPC_FAULT", error.code)
+        assertFalse(error.explicitRejection)
+    }
     @Test fun profilesDoNotPrintSecrets() {
         val profile = Profile("id", "label", "https://lab/", "root", "sensitive-password", "a".repeat(64))
         assertFalse(profile.toString().contains("sensitive-password"))

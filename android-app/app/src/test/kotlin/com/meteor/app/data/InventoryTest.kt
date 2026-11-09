@@ -32,12 +32,31 @@ class InventoryTest {
         assertNull(InventoryMapper.normalize(pools, hosts, emptyMap(), emptyMap(), emptyMap(), 1).hosts.single().totalBytes)
     }
     @Test fun excludesIsoCapacityAndRejectsAmbiguousIdentity() {
-        val storage = mapOf("disk" to mapOf("physical_size" to "1000", "physical_utilisation" to "250"),
-            "iso" to mapOf("content_type" to "iso", "physical_size" to "1000", "physical_utilisation" to "1000"))
+        val storage = mapOf("disk" to mapOf("uuid" to "disk-id", "physical_size" to "1000", "physical_utilisation" to "250"),
+            "iso" to mapOf("uuid" to "iso-id", "content_type" to "iso", "physical_size" to "1000", "physical_utilisation" to "1000"))
         val inventory = InventoryMapper.normalize(pools, hosts, metrics, emptyMap(), storage, 1)
         assertEquals(1000, inventory.storageTotal); assertEquals(250, inventory.storageUsed)
+        assertEquals(2, inventory.repositories.size)
         assertThrows(IllegalArgumentException::class.java) { InventoryMapper.normalize(emptyMap(), hosts, metrics, emptyMap(), storage, 1) }
         assertThrows(IllegalArgumentException::class.java) { InventoryMapper.normalize(pools, hosts, metrics, mapOf("a" to vm("duplicate"), "b" to vm("duplicate")), storage, 1) }
+    }
+    @Test fun hostAndStorageDetailsComeFromTheSameSnapshot() {
+        val host = hosts.mapValues { it.value + mapOf("name_description" to "Compute", "software_version" to mapOf("product_version" to "8.3")) }
+        val storage = mapOf("sr-ref" to mapOf("uuid" to "sr-id", "name_label" to "Data", "type" to "lvm",
+            "content_type" to "user", "physical_size" to "1000", "physical_utilisation" to "250", "name_description" to "VM disks"))
+        val inventory = InventoryMapper.normalize(pools, host, metrics, emptyMap(), storage, 123)
+        assertEquals("8.3", inventory.hosts.single().softwareVersion)
+        assertEquals("Compute", inventory.hosts.single().description)
+        assertEquals(StorageRepository("sr-id", "Data", "lvm", "user", 1000, 250, "VM disks"), inventory.repositories.single())
+        assertEquals(123, inventory.observedAtMillis)
+    }
+    @Test fun missingAndDuplicateStorageIdentitiesCannotProduceAmbiguousRows() {
+        for (storage in listOf(mapOf("a" to mapOf("uuid" to "")),
+            mapOf("a" to mapOf("uuid" to "same"), "b" to mapOf("uuid" to "same")))) {
+            assertThrows(IllegalArgumentException::class.java) {
+                InventoryMapper.normalize(pools, hosts, metrics, emptyMap(), storage, 0)
+            }
+        }
     }
     @Test fun malformedHostIdentitiesAreRejectedBeforeRendering() {
         for (id in listOf("", " ")) {

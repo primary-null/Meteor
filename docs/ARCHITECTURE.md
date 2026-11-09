@@ -33,6 +33,10 @@ Meteor is one Android application module (`android-app/app`) in a single package
 
 `MeteorGateway` and `PowerBackend` are interfaces, so tests replace the network with in-memory fakes. One JVM test (`XapiTransportIntegrationTest`) instead runs the production TLS, HTTP and XML-RPC path against a loopback `HttpsServer` with a throwaway certificate.
 
+`ConnectionController` owns connection generations, explicit trust review and serialized profile commits, with injected `CertificateInspector` and `ProfileStorage` boundaries. `MeteorViewModel` coordinates that controller with VM details and power operations. The controller's cancellation, failed-write and session-only behavior is covered directly by JVM tests.
+
+Host and storage dialogs use the same validated pool snapshot as Overview and expose no mutation controls. Storage entries have unique identities; ISO repositories appear in details but do not inflate disk-capacity totals.
+
 ## Power operation lifecycle
 
 ```
@@ -50,7 +54,7 @@ UNKNOWN ──(Manual review + acknowledgement)──► UNKNOWN, closed with Ma
 Invariants:
 
 - `submit` is called from exactly one place, after the `SUBMITTING` record has been written. `reconcile` and `review` never call it.
-- At most one unresolved record exists, and while it does, no new action can be confirmed.
+- A new action requires the complete journal to contain no unresolved records. All unresolved records remain retained and block new submissions.
 - Automatic recovery requires the original profile *and* its original origin, a hash of the normalised endpoint, the certificate pin and the username. A repaired connection (for example after a certificate renewal) can be used only for an explicit manual review.
 - Success requires read-back. A reboot is verified only by a changed, valid boot timestamp, because the VM's power state is `Running` both before and after.
 - Manual closure keeps `phase = UNKNOWN` and attaches a `ManualResolution`, so history never claims a success it did not observe.
@@ -60,6 +64,10 @@ Invariants:
 - `PowerService` holds a process-wide `Mutex`, so all execute, reconcile and review calls are serialised even across ViewModel instances.
 - The ViewModel tags each inventory and detail request with a generation number and drops responses whose generation, profile or pool no longer match.
 - Polling (inventory every 30 s when stale, open VM details every 5 s) runs inside `repeatOnLifecycle(STARTED)`, so it stops when the app is in the background.
+
+`DetailPolling` permits reuse of display-only disk/network topology for less than 60 seconds, bound to the original connection, pool and VM. Changed device references, power, boot or active operations force a full read. Every poll still reads current power, boot, allowed operations and active operations. The detail view identifies the topology observation time. Explicit detail refresh and `PowerConnection.details` always perform a full read.
+
+Action history is read-only presentation over the existing journal. An atomic state revision prevents a delayed history read from replacing a newer operation callback. Manual closure remains an unknown original outcome, while successful task and VM verification is labelled separately. Informational, warning and error notices are typed rather than inferred from message text.
 
 ## Reference model (`meteor_logic/`)
 

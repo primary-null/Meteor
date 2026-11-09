@@ -4,7 +4,7 @@ import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.StringReader
 
-class RpcFailure(val code: String) : Exception("XAPI request failed ($code)")
+class RpcFailure(val code: String, val explicitRejection: Boolean = true) : Exception("XAPI request failed ($code)")
 
 object XmlRpc {
     private fun escape(value: String): String = buildString {
@@ -84,7 +84,8 @@ object XmlRpc {
         }
         parser.nextTag(); parser.require(XmlPullParser.START_TAG, null, "methodResponse")
         nextTag()
-        if (parser.name == "fault") throw RpcFailure("RPC_FAULT")
+        // A generic RPC fault is not proof that XAPI rejected a mutation before accepting it.
+        if (parser.name == "fault") throw RpcFailure("RPC_FAULT", explicitRejection = false)
         parser.require(XmlPullParser.START_TAG, null, "params")
         nextTag(); parser.require(XmlPullParser.START_TAG, null, "param")
         nextTag()
@@ -93,9 +94,14 @@ object XmlRpc {
         nextTag(); parser.require(XmlPullParser.END_TAG, null, "params")
         nextTag(); parser.require(XmlPullParser.END_TAG, null, "methodResponse")
         val envelope = result as? Map<*, *> ?: throw IllegalArgumentException("Missing XAPI envelope.")
-        if (envelope["Status"] != "Success") {
-            val code = (envelope["ErrorDescription"] as? List<*>)?.firstOrNull()?.toString().orEmpty()
-            throw RpcFailure(code.takeIf { it.matches(Regex("[A-Z0-9_]+")) } ?: "UNKNOWN")
+        when (envelope["Status"]) {
+            "Success" -> require(envelope.containsKey("Value")) { "Missing XAPI value." }
+            "Failure" -> {
+                val code = (envelope["ErrorDescription"] as? List<*>)?.firstOrNull() as? String
+                require(code != null && code.matches(Regex("[A-Z0-9_]+"))) { "Invalid XAPI failure." }
+                throw RpcFailure(code)
+            }
+            else -> throw IllegalArgumentException("Invalid XAPI status.")
         }
         return envelope["Value"]
     }

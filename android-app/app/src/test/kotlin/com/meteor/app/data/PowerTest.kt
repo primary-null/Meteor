@@ -19,11 +19,13 @@ class PowerTest {
     private class Backend(var current: VmDetails, val store: Store) : PowerBackend, PowerConnection {
         var sends = 0; var networkFailure = false; var status = "success"; var after: VmDetails = current.copy(power = "Running")
         var submitted = false
+        var submissionFailure: Exception? = null
         override suspend fun <T> powerConnection(profile: Profile, action: suspend PowerConnection.() -> T): T = action(this)
         override suspend fun details(authority: String, uuid: String) = if (submitted) after else current
         override suspend fun submit(authority: String, uuid: String, action: PowerAction): String {
             assertEquals(PowerPhase.SUBMITTING, store.records.values.last().phase)
             sends++; submitted = true
+            submissionFailure?.let { throw it }
             if (networkFailure) throw IOException("lost response")
             return "task-ref"
         }
@@ -70,6 +72,32 @@ class PowerTest {
         assertEquals(PowerPhase.SUCCEEDED, service(backend, store).reconcile(profile, op).phase)
         assertEquals(1, backend.sends)
     }
+    @Test fun sameBootInstantInDifferentFormatsDoesNotVerifyReboot() = runTest {
+        for (same in listOf("2026-01-01T10:00:00Z", "20260101T10:00:00.000Z", "2026-01-01T11:00:00+01:00")) {
+            val store = Store(); val backend = Backend(vm("Running"), store)
+            backend.after = backend.current.copy(bootTime = same)
+            val service = service(backend, store)
+            val result = service.execute(profile, confirmation(backend.current, PowerAction.REBOOT))
+            assertEquals(PowerPhase.UNKNOWN, result.phase)
+            backend.after = backend.current.copy(bootTime = "2026-01-01T10:01:00Z")
+            assertEquals(PowerPhase.SUCCEEDED, service.reconcile(profile, result).phase)
+            assertEquals(1, backend.sends)
+        }
+    }
+    @Test fun onlyExplicitXapiRejectionReleasesTheDuplicateFence() = runTest {
+        for (explicit in listOf(false, true)) {
+            val store = Store(); val backend = Backend(vm(), store)
+            backend.submissionFailure = RpcFailure(if (explicit) "OPERATION_NOT_ALLOWED" else "RPC_FAULT", explicit)
+            val service = service(backend, store)
+            val result = service.execute(profile, confirmation(backend.current))
+            assertEquals(if (explicit) PowerPhase.FAILED else PowerPhase.UNKNOWN, result.phase)
+            if (!explicit) {
+                assertTrue(runCatching { service.execute(profile, confirmation(backend.current)) }.isFailure)
+                assertEquals(PowerPhase.UNKNOWN, service.reconcile(profile, result).phase)
+            }
+            assertEquals(1, backend.sends)
+        }
+    }
     @Test fun staleOrDifferentOriginConfirmationNeverSends() = runTest {
         val store = Store(); val backend = Backend(vm(), store)
         val stale = confirmation(backend.current.copy(observedAt = -30_001))
@@ -94,6 +122,14 @@ class PowerTest {
         assertFalse(PowerRules.validBoot("19700101T00:00:00Z"))
         assertTrue(PowerRules.validBoot("20260101T10:00:00Z"))
         assertTrue(PowerRules.validBoot("2026-01-01T10:00:00Z"))
+    }
+    @Test fun disabledActionExplanationsMatchTheActualEligibilityGate() {
+        val cases = listOf(vm(), vm("Running"), vm("Running", null), vm().copy(currentOperations = true), vm().copy(allowed = emptySet()))
+        for (current in cases) for (action in PowerAction.entries) {
+            assertEquals(PowerRules.eligible(current, action), PowerRules.unavailableReason(current, action) == null)
+        }
+        assertTrue(PowerRules.unavailableReason(vm().copy(allowed = emptySet()), PowerAction.START)!!.contains("server"))
+        assertFalse(PowerRules.unavailableReason(vm().copy(allowed = emptySet()), PowerAction.START)!!.contains("permission"))
     }
     @Test fun pendingOrFailedTaskIsNeverReportedSuccessful() = runTest {
         listOf("pending", "failure", "cancelled").forEach { status ->
