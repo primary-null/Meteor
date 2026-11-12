@@ -118,7 +118,8 @@ class DetailRaceDeviceTest {
     @Test fun openingDuringInventoryRefreshLoadsWhenConnectionIsReady() = runBlocking<Unit> {
         val inventory = CompletableDeferred<Inventory>()
         backend.inventoryResult = inventory
-        main { model.refresh() }
+        // An explicit reconnect: a background refresh of a connected model keeps `connected` and never sets `loading`.
+        main { model.switchProfile(profile) }
         awaitState { it.loading }
         main { model.openDetails(guest("a")) }
         assertEquals("a", model.state.value.selectedGuest?.uuid)

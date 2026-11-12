@@ -13,7 +13,11 @@ internal class ObservabilityController(
     private var activityGeneration = 0L
     private var metricsJob: Job? = null
     private var activityJob: Job? = null
+    // --- A3 observability --- history and detail reads share this controller's lifecycle and fences
+    internal val depth = DepthController(scope, gateway, state, refreshLive = { refreshMetrics() })
+    // --- end A3 observability ---
     fun invalidate() {
+        depth.invalidate() // A3 observability
         metricsGeneration++; activityGeneration++
         metricsJob?.cancel(); activityJob?.cancel()
         state.update { it.copy(metricTarget = null, metricSamples = emptyList(), metricsBusy = false, metricsProblem = null,
@@ -30,12 +34,14 @@ internal class ObservabilityController(
             else inventory.hosts.any { it.uuid == target.uuid }
         if (!visible) return
         if (state.value.metricTarget != target) {
+            depth.resetHistory() // A3 observability: charts never carry over to another object
             metricsGeneration++; metricsJob?.cancel()
             state.update { it.copy(metricTarget = target, metricSamples = emptyList(), metricsBusy = false, metricsProblem = null) }
         }
         refreshMetrics()
     }
     fun refreshMetrics() {
+        if (state.value.depth.history.range != null) return // A3 observability: the history view replaces live polling
         if (!ready() || state.value.metricsBusy) return
         val profile = state.value.selectedProfile ?: return
         val target = state.value.metricTarget ?: return
@@ -75,9 +81,6 @@ internal class ObservabilityController(
             } finally { if (request == activityGeneration) state.update { it.copy(activityBusy = false) } }
         }
     }
-    private fun issue(error: Throwable, feature: String): String = when {
-        error is UnsupportedOperationException || error is RpcFailure && error.code in setOf("MESSAGE_METHOD_UNKNOWN", "NOT_IMPLEMENTED") -> "$feature is not supported by this server."
-        error is RpcFailure && error.code in setOf("RBAC_PERMISSION_DENIED", "PERMISSION_DENIED") -> "$feature is not available to this account."
-        else -> "$feature could not be refreshed securely. Any displayed values are last known. Check the connection before trying again."
-    }
+    // A4: adds the XAPI code or gateway reason to the sentence; see ErrorReasons.readIssue.
+    private fun issue(error: Throwable, feature: String): String = ErrorReasons.readIssue(error, feature)
 }

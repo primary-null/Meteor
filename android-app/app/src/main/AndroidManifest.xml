@@ -1,7 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
-<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- B3 background/summary: opt-in alert notifications. Requested only when the user turns a profile's switch on. -->
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- B3: the background check never runs as a foreground service, so WorkManager's foreground support is removed. -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" tools:node="remove" />
 
     <application
         android:allowBackup="false"
@@ -22,6 +27,10 @@
                 <category android:name="android.intent.category.LAUNCHER" />
             </intent-filter>
         </activity>
+        <!-- B3: never used; Meteor does not call setForeground or expedited work. -->
+        <service
+            android:name="androidx.work.impl.foreground.SystemForegroundService"
+            tools:node="remove" />
     </application>
 
 </manifest>

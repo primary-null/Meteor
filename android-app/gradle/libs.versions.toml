@@ -12,6 +12,8 @@ datastore = "1.2.1"
 junit = "4.13.2"
 kotlin = "2.4.21"
 kxml2 = "2.3.0"
+# B3 background/summary: periodic, constraint-aware alert checks without a foreground service.
+work = "2.12.0"
 
 [libraries]
 androidx-core-ktx = { module = "androidx.core:core-ktx", version.ref = "androidxCore" }
@@ -33,6 +35,7 @@ junit = { module = "junit:junit", version.ref = "junit" }
 kotlinx-coroutines-test = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-test", version.ref = "coroutines" }
 androidx-datastore-preferences = { module = "androidx.datastore:datastore-preferences", version.ref = "datastore" }
 kxml2 = { module = "net.sf.kxml:kxml2", version.ref = "kxml2" }
+androidx-work-runtime-ktx = { module = "androidx.work:work-runtime-ktx", version.ref = "work" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "androidGradlePlugin" }

@@ -9,6 +9,9 @@ data class Profile(
     val username: String,
     val password: String,
     val certificateSha256: String,
+    // --- B1 console --- Pins the user approved for pool member hosts that serve consoles (authority -> leaf SHA-256).
+    val memberPins: Map<String, String> = emptyMap(),
+    // --- end B1 console ---
 ) {
     override fun toString() = "Profile(id=$id, credentials=redacted)"
 }

@@ -21,16 +21,24 @@ object ConnectionProfiles {
             "Up to ${ProfileDocument.MAX_PROFILES} connections can be saved. Edit or forget an existing profile."
         }
         return Profile(original?.id ?: UUID.randomUUID().toString(), label.trim().ifBlank { "XCP-ng connection" },
-            endpoint, user, credential, original?.takeIf { it.endpoint == endpoint }?.certificateSha256.orEmpty())
+            endpoint, user, credential, original?.takeIf { it.endpoint == endpoint }?.certificateSha256.orEmpty(),
+            // --- B1 console --- Member pins belong to the same server address; a new address starts without any.
+            memberPins = original?.takeIf { it.endpoint == endpoint }?.memberPins.orEmpty())
     }
 
     fun put(document: ProfileDocument, profile: Profile, selectedId: String? = profile.id): ProfileDocument {
         require(document.profiles.none { it.id != profile.id && it.endpoint == profile.endpoint && it.username == profile.username }) {
             "Another profile already uses this server and username."
         }
+        // --- B1 console --- A write built from an older copy of the profile must not drop member pins approved
+        // meanwhile. Pins of the same server address are merged; the incoming profile wins for the same host.
+        val stored = document.profiles.firstOrNull { it.id == profile.id }
+        val merged = if (stored != null && stored.endpoint == profile.endpoint && stored.memberPins.isNotEmpty())
+            profile.copy(memberPins = stored.memberPins + profile.memberPins) else profile
+        // --- end B1 console ---
         val profiles = if (document.profiles.any { it.id == profile.id })
-            document.profiles.map { if (it.id == profile.id) profile else it }
-        else document.profiles + profile
+            document.profiles.map { if (it.id == profile.id) merged else it }
+        else document.profiles + merged
         return ProfileDocument(profiles, selectedId)
     }
 

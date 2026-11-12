@@ -1,0 +1,6 @@
+<!-- B3 background/summary: notification small icon (white on transparent), cropped from the monochrome mark. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android" android:width="24dp" android:height="24dp" android:viewportWidth="68" android:viewportHeight="68">
+    <group android:translateX="-19" android:translateY="-20">
+        <path android:strokeColor="#FFFFFFFF" android:strokeWidth="4" android:fillColor="#00000000" android:strokeLineJoin="round" android:pathData="M23,23 L63,47 L83,66 L79,80 L65,85 L49,72 L46,60 Z M23,23 L49,72 M23,23 L79,80 M46,60 L63,47 M49,72 L83,66 M65,85 L63,47" />
+    </group>
+</vector>

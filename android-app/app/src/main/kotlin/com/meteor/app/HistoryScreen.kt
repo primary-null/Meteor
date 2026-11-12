@@ -18,7 +18,7 @@ internal fun HistoryScreen(state: MeteorState, refresh: () -> Unit, back: () -> 
             Text("Action history", style = MaterialTheme.typography.headlineMedium)
             Text("Saved on this device. The latest 50 closed actions and all unresolved actions are retained.", style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                TextButton(onClick = back) { Text("Back to settings") }
+                TextButton(onClick = back) { Text("Back") }
                 OutlinedButton(onClick = refresh, enabled = !state.historyLoading && !state.operationBusy && !state.profileBusy) { Text("Reload history") }
             }
         }
@@ -28,7 +28,7 @@ internal fun HistoryScreen(state: MeteorState, refresh: () -> Unit, back: () -> 
         items(state.history, key = { it.id }) { operation ->
             ElevatedCard(Modifier.fillMaxWidth()) {
                 Column(Modifier.padding(16.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
-                    Text("${operation.vmName} · ${operation.action.title}", style = MaterialTheme.typography.titleMedium)
+                    Text(OperationHistory.title(operation), style = MaterialTheme.typography.titleMedium) // B2 storage/host: target-aware title
                     Text(OperationHistory.status(operation), style = MaterialTheme.typography.labelLarge)
                     Text(state.profiles.firstOrNull { it.id == operation.profileId }?.label ?: "Saved connection unavailable", style = MaterialTheme.typography.bodySmall)
                     Text(DateFormat.getDateTimeInstance(DateFormat.MEDIUM, DateFormat.SHORT).format(Date(operation.updatedAt)),

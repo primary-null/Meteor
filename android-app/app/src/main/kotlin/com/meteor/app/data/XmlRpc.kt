@@ -4,7 +4,19 @@ import org.xmlpull.v1.XmlPullParser
 import org.xmlpull.v1.XmlPullParserFactory
 import java.io.StringReader
 
-class RpcFailure(val code: String, val explicitRejection: Boolean = true) : Exception("XAPI request failed ($code)")
+// --- A4 alerts/events ---
+// `details` keeps the XAPI error parameters (ErrorDescription minus the code), capped. They can carry the
+// pool master address (HOST_IS_SLAVE) or a permission name (RBAC_PERMISSION_DENIED). The exception message
+// stays code-only, and callers must pick which details they show.
+class RpcFailure(val code: String, val explicitRejection: Boolean = true, val details: List<String> = emptyList()) :
+    Exception("XAPI request failed ($code)")
+
+/** Encoded as `<dateTime.iso8601>` (UTC, `yyyyMMdd'T'HH:mm:ss'Z'`), the type XAPI expects for `datetime` arguments. */
+class XmlRpcDateTime(val epochMillis: Long) {
+    val text: String get() = java.time.format.DateTimeFormatter.ofPattern("yyyyMMdd'T'HH:mm:ss'Z'")
+        .withZone(java.time.ZoneOffset.UTC).format(java.time.Instant.ofEpochMilli(epochMillis))
+}
+// --- end A4 ---
 
 object XmlRpc {
     private fun escape(value: String): String = buildString {
@@ -15,7 +27,15 @@ object XmlRpc {
     }
     private fun value(input: Any?): String = when (input) {
         is Boolean -> "<boolean>${if (input) 1 else 0}</boolean>"
+        // --- A4 alerts/events ---
+        is Double -> { require(input.isFinite()) { "Invalid XML-RPC number." }; "<double>${String.format(java.util.Locale.ROOT, "%.3f", input)}</double>" }
+        is XmlRpcDateTime -> "<dateTime.iso8601>${input.text}</dateTime.iso8601>"
+        // --- end A4 ---
         is List<*> -> "<array><data>" + input.joinToString("") { "<value>${value(it)}</value>" } + "</data></array>"
+        // A2 operations: string-keyed structs, e.g. the pool_migrate options map.
+        is Map<*, *> -> "<struct>" + input.entries.joinToString("") { (key, item) ->
+            "<member><name>${escape(key as? String ?: throw IllegalArgumentException("Struct keys must be strings."))}</name><value>${value(item)}</value></member>"
+        } + "</struct>"
         else -> "<string>${escape(input?.toString().orEmpty())}</string>"
     }
     fun request(method: String, arguments: List<Any?>): ByteArray {
@@ -97,9 +117,10 @@ object XmlRpc {
         when (envelope["Status"]) {
             "Success" -> require(envelope.containsKey("Value")) { "Missing XAPI value." }
             "Failure" -> {
-                val code = (envelope["ErrorDescription"] as? List<*>)?.firstOrNull() as? String
+                val description = envelope["ErrorDescription"] as? List<*>
+                val code = description?.firstOrNull() as? String
                 require(code != null && code.matches(Regex("[A-Z0-9_]+"))) { "Invalid XAPI failure." }
-                throw RpcFailure(code)
+                throw RpcFailure(code, details = description.orEmpty().drop(1).filterIsInstance<String>().take(8).map { it.take(200) }) // A4
             }
             else -> throw IllegalArgumentException("Invalid XAPI status.")
         }

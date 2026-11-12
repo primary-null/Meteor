@@ -25,18 +25,8 @@ class OperationJournal(context: Context, name: String = "operations-v1.json") : 
         require(bytes.size <= 512 * 1024)
         val root = JSONObject(String(bytes, Charsets.UTF_8)); require(root.getInt("version") == 1)
         val array = root.getJSONArray("operations"); require(array.length() <= 100)
-        val list = (0 until array.length()).map { index ->
-            val j = array.getJSONObject(index)
-            PowerOperation(j.getString("id"), j.getString("profile"), j.getString("origin"), j.getString("authority"),
-                j.getString("vm"), j.getString("name"), PowerAction.valueOf(j.getString("action")),
-                j.optString("beforeBoot").takeIf { it.isNotBlank() }, PowerPhase.valueOf(j.getString("phase")),
-                j.getLong("createdAt"), j.getLong("updatedAt"), j.optString("taskRef").takeIf { it.isNotBlank() },
-                j.optString("taskUuid").takeIf { it.isNotBlank() }, j.getString("message"),
-                if (j.has("manualResolution")) j.getJSONObject("manualResolution").let { review ->
-                    ManualResolution(review.getLong("reviewedAt"), review.getString("origin"), review.getString("power"),
-                        review.optString("bootTime").takeIf { it.isNotBlank() })
-                } else null)
-        }
+        // A2 operations: JournalCodec reads 1.9 records unchanged and keeps unknown kinds as locked foreign records.
+        val list = (0 until array.length()).map { index -> JournalCodec.decode(fields(array.getJSONObject(index))) }
         require(list.map { it.id }.distinct().size == list.size)
         list
     }
@@ -46,17 +36,26 @@ class OperationJournal(context: Context, name: String = "operations-v1.json") : 
         val keep = all.filter { it.unresolved } + all.filterNot { it.unresolved }.sortedByDescending { it.updatedAt }.take(50)
         require(keep.size <= 100)
         val root = JSONObject().put("version", 1).put("operations", JSONArray().apply { keep.forEach { op ->
-            val item = JSONObject().put("id", op.id).put("profile", op.profileId).put("origin", op.origin).put("authority", op.authority)
-                .put("vm", op.vmUuid).put("name", op.vmName).put("action", op.action.name).put("beforeBoot", op.beforeBoot.orEmpty())
-                .put("phase", op.phase.name).put("createdAt", op.createdAt).put("updatedAt", op.updatedAt)
-                .put("taskRef", op.taskRef.orEmpty()).put("taskUuid", op.taskUuid.orEmpty()).put("message", op.message)
-            op.manualResolution?.let { review -> item.put("manualResolution", JSONObject()
-                .put("reviewedAt", review.reviewedAt).put("origin", review.origin).put("power", review.power)
-                .put("bootTime", review.bootTime.orEmpty())) }
-            put(item)
+            put(json(JournalCodec.encode(op)))
         } })
         val stream = file.startWrite()
         try { stream.write(root.toString().toByteArray()); file.finishWrite(stream) }
         catch (error: Exception) { file.failWrite(stream); throw error }
     }
+    // --- A2 operations ---
+    private fun fields(item: JSONObject): Map<String, Any?> = item.keys().asSequence().associateWith { plain(item.get(it)) }
+    private fun plain(value: Any?): Any? = when (value) {
+        JSONObject.NULL -> null
+        is JSONObject -> fields(value)
+        is JSONArray -> (0 until value.length()).map { plain(value.get(it)) }
+        else -> value
+    }
+    private fun json(fields: Map<String, Any?>): JSONObject = JSONObject().apply { fields.forEach { (key, value) -> put(key, jsonValue(value)) } }
+    private fun jsonValue(value: Any?): Any = when (value) {
+        null -> JSONObject.NULL
+        is Map<*, *> -> json(value.entries.associate { it.key.toString() to it.value })
+        is List<*> -> JSONArray().apply { value.forEach { put(jsonValue(it)) } }
+        else -> value
+    }
+    // --- end A2 operations ---
 }

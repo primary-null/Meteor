@@ -3,6 +3,10 @@ package com.meteor.app.data
 import com.meteor.app.BuildConfig
 import com.sun.net.httpserver.HttpsConfigurator
 import com.sun.net.httpserver.HttpsServer
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.cancelAndJoin
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import org.junit.After
 import org.junit.AfterClass
@@ -71,6 +75,22 @@ class XapiTransportIntegrationTest {
     private var activeOperation = false
     private var rpcErrors = emptyMap<String, String>()
     private var changePoolAfterRead = false
+    // --- A4 alerts/events ---
+    private class FixtureFailure(val code: String, val params: List<String>) : Exception(code)
+    private var rpcParams = emptyMap<String, List<String>>()
+    private var faultMethods = emptySet<String>()
+    private var messages: Map<String, Map<String, Any>> = mapOf("alert-ref" to mapOf("uuid" to "alert-id", "name" to "Example alert", "body" to "Details"))
+    private var sinceMessages: Map<String, Map<String, Any>> = emptyMap()
+    private var largeMessageStore = false
+    private val destroyed = CopyOnWriteArrayList<String>()
+    private var stuckMessages = emptySet<String>()
+    @Volatile private var eventDelayMillis = 0L
+    private var eventPayload: List<Map<String, Any>> = emptyList()
+    private fun stringParam(body: String, index: Int): String =
+        Regex("<string>(.*?)</string>").find(body.split("<param>")[index + 1])?.groupValues?.get(1).orEmpty()
+    private fun failure(code: String, params: List<String>) = "<methodResponse><params><param><value>" +
+        value(mapOf("Status" to "Failure", "ErrorDescription" to listOf(code) + params)) + "</value></param></params></methodResponse>"
+    // --- end A4 ---
 
     @Before fun startFixture() {
         server = HttpsServer.create(InetSocketAddress("127.0.0.1", 0), 0).apply {
@@ -88,10 +108,11 @@ class XapiTransportIntegrationTest {
                     exchange.responseHeaders.add("Location", "https://127.0.0.1:${server.address.port}/redirected")
                     exchange.sendResponseHeaders(302, -1)
                 } else {
+                    if (method == "event.from" && eventDelayMillis > 0) Thread.sleep(eventDelayMillis) // A4: a long-poll that answers late
                     val xml = if (malformedPool && method == "pool.get_all_records") "<broken>"
-                    else rpcErrors[method]?.let { code -> "<methodResponse><params><param><value>" +
-                        value(mapOf("Status" to "Failure", "ErrorDescription" to listOf(code, "private argument"))) +
-                        "</value></param></params></methodResponse>" } ?: response(result(method))
+                    else if (method in faultMethods) "<methodResponse><fault><value><string>fixture fault</string></value></fault></methodResponse>"
+                    else rpcErrors[method]?.let { code -> failure(code, rpcParams[method] ?: listOf("private argument")) }
+                        ?: try { response(result(method)) } catch (error: FixtureFailure) { failure(error.code, error.params) }
                     val bytes = xml.toByteArray(Charsets.UTF_8)
                     exchange.responseHeaders.add("Content-Type", "text/xml; charset=utf-8")
                     exchange.sendResponseHeaders(200, bytes.size.toLong())
@@ -126,7 +147,16 @@ class XapiTransportIntegrationTest {
             "value" to "0.25", "units" to "fraction"))
         "task.get_all_records" -> mapOf("task-ref" to mapOf("uuid" to "task-id", "name_label" to "Example task",
             "status" to "pending", "progress" to "1.0"))
-        "message.get_all_records" -> mapOf("alert-ref" to mapOf("uuid" to "alert-id", "name" to "Example alert", "body" to "Details"))
+        "message.get_all_records" -> if (largeMessageStore) (0 until 4000).associate { "ref-$it" to mapOf("uuid" to "u$it", "name" to "VM_STARTED", "priority" to "5",
+            "cls" to "VM", "obj_uuid" to "vm-id", "timestamp" to "20261112T10:00:00Z", "body" to "b$it") } else messages
+        // --- A4 alerts/events ---
+        "message.get_since" -> sinceMessages
+        "message.destroy" -> { destroyed += stringParam(bodies.last(), 1); "" }
+        "message.get_record" -> stringParam(bodies.last(), 1).let { ref ->
+            if (ref in destroyed && ref !in stuckMessages) throw FixtureFailure("HANDLE_INVALID", listOf("message", ref)) else mapOf("uuid" to "uuid-of-$ref") }
+        "event.from" -> mapOf("token" to "tok-" + ((stringParam(bodies.last(), 2).removePrefix("tok-").toIntOrNull() ?: 0) + 1),
+            "events" to eventPayload, "valid_ref_counts" to mapOf("VM" to "1"))
+        // --- end A4 ---
         "VM.get_record" -> mapOf("uuid" to "vm-id", "name_label" to "Fixture VM", "power_state" to "Running",
             "VCPUs_max" to "2", "memory_static_max" to "4096", "metrics" to "vm-metrics", "VBDs" to diskRefs,
             "VIFs" to listOf("vif-ref"), "allowed_operations" to allowedOperations,
@@ -269,4 +299,177 @@ class XapiTransportIntegrationTest {
         gateway.powerConnection(profile) { details("pool-id", "vm-id") }
         assertTrue(calls.containsAll(listOf("VBD.get_record", "VDI.get_record", "VIF.get_record", "network.get_record")))
     }
+
+    // --- A4 alerts/events ---
+    private val message = mapOf("uuid" to "u-new", "name" to "ha_host_failed", "priority" to "2", "cls" to "Host", "obj_uuid" to "host-id",
+        "timestamp" to "20261112T10:00:00Z", "body" to "A host died")
+
+    @Test fun fullAlertReadUsesGetAllRecordsAndChecksThePoolBeforeAndAfter() = runBlocking {
+        val fetch = XapiGateway { 1_800_000_000_000L }.alerts(profile, "pool-id", null)
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "message.get_all_records", "pool.get_all_records", "session.logout"), calls.toList())
+        assertTrue(fetch.full); assertFalse(fetch.truncated)
+        assertEquals("alert-ref", fetch.messages.single().ref); assertEquals("Example alert", fetch.messages.single().name)
+        assertEquals(1_800_000_000_000L, fetch.observedAt)
+    }
+    @Test fun incrementalAlertReadSendsADateTimeAndParsesTheNewMessages() = runBlocking {
+        sinceMessages = mapOf("ref-new" to message)
+        val fetch = XapiGateway { 1_800_000_000_000L }.alerts(profile, "pool-id", 1_800_000_000_000L)
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "message.get_since", "pool.get_all_records", "session.logout"), calls.toList())
+        assertTrue(bodies[calls.indexOf("message.get_since")].contains("<dateTime.iso8601>20270115T08:00:00Z</dateTime.iso8601>"))
+        assertFalse(fetch.full)
+        val parsed = fetch.messages.single()
+        assertEquals("ref-new", parsed.ref); assertEquals(2, parsed.priority); assertEquals(AlertObjectKind.HOST, parsed.objectKind)
+        assertEquals("host-id", parsed.objectUuid); assertNotNull(parsed.timestamp)
+    }
+    @Test fun aMessageStoreTooLargeToParseFallsBackToTheRecentWindowAndSaysSo() = runBlocking {
+        largeMessageStore = true; sinceMessages = mapOf("ref-new" to message)
+        val fetch = XapiGateway { 1_800_000_000_000L }.alerts(profile, "pool-id", null)
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "message.get_all_records", "message.get_since", "pool.get_all_records", "session.logout"), calls.toList())
+        assertFalse(fetch.full); assertTrue(fetch.truncated)
+        assertEquals(listOf("ref-new"), fetch.messages.map { it.ref })
+        assertTrue(bodies[calls.indexOf("message.get_since")].contains("<dateTime.iso8601>20270112T08:00:00Z</dateTime.iso8601>"))   // now minus three days
+    }
+    @Test fun alertReadsKeepTheirIdentityChecksAndNeverWrite() = runBlocking {
+        assertTrue(runCatching { XapiGateway().alerts(profile, "other-pool", null) }.isFailure)
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "session.logout"), calls.toList())
+        calls.clear()
+        assertTrue(runCatching { XapiGateway().alerts(profile.copy(certificateSha256 = "0".repeat(64)), "pool-id", null) }.isFailure)
+        assertTrue(calls.isEmpty())
+        assertTrue(calls.none { it.startsWith("Async.") || it.endsWith(".destroy") })
+    }
+
+    @Test fun dismissingDestroysEachMessageAndConfirmsRemovalByReadBack() = runBlocking {
+        val outcome = XapiGateway().dismissAlerts(profile, "pool-id", listOf(AlertTarget("a", "ua"), AlertTarget("b", "ub")))
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "message.destroy", "message.get_record",
+            "message.destroy", "message.get_record", "session.logout"), calls.toList())
+        assertEquals(setOf("a", "b"), outcome.removed); assertEquals(listOf("a", "b"), destroyed.toList())
+        assertTrue(outcome.results.all { it.status == DismissStatus.REMOVED })
+        assertTrue(calls.none { it.startsWith("Async.") || it.startsWith("VM.") })       // not a VM operation, never the power path
+    }
+    @Test fun aPermissionRefusalStopsTheBatchAndKeepsTheServersReason() = runBlocking {
+        rpcErrors = mapOf("message.destroy" to "RBAC_PERMISSION_DENIED")
+        rpcParams = mapOf("message.destroy" to listOf("message.destroy", "No permission in user session"))
+        val outcome = XapiGateway().dismissAlerts(profile, "pool-id", listOf(AlertTarget("a", "ua"), AlertTarget("b", "ub"), AlertTarget("c", "uc")))
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "message.destroy", "session.logout"), calls.toList())
+        assertEquals(listOf(DismissStatus.REFUSED, DismissStatus.NOT_SENT, DismissStatus.NOT_SENT), outcome.results.map { it.status })
+        assertEquals("RBAC_PERMISSION_DENIED", outcome.denied?.code); assertEquals("message.destroy", outcome.denied?.permission)
+        assertTrue(outcome.removed.isEmpty()); assertTrue(destroyed.isEmpty())
+    }
+    @Test fun aDestroyThatDoesNotTakeEffectIsStillPresentAndNeverReportedAsRemoved() = runBlocking {
+        stuckMessages = setOf("a")
+        val outcome = XapiGateway().dismissAlerts(profile, "pool-id", listOf(AlertTarget("a", "ua"), AlertTarget("b", "ub")))
+        assertEquals(DismissStatus.STILL_PRESENT, outcome.results[0].status); assertEquals(DismissStatus.REMOVED, outcome.results[1].status)
+        assertEquals(setOf("b"), outcome.removed); assertEquals(1, outcome.unconfirmed)
+    }
+    @Test fun anAmbiguousDestroyIsNeverAssumedToHaveWorked() = runBlocking {
+        faultMethods = setOf("message.destroy")                                            // a generic RPC fault, not an explicit XAPI rejection
+        val outcome = XapiGateway().dismissAlerts(profile, "pool-id", listOf(AlertTarget("a", "ua")))
+        assertEquals(DismissStatus.STILL_PRESENT, outcome.results.single().status)
+        assertTrue(calls.contains("message.get_record"))                                   // the read-back decided
+        assertTrue(outcome.removed.isEmpty())
+    }
+    @Test fun dismissRejectsEmptyOversizedAndDuplicateBatchesBeforeAnyDestroy() = runBlocking {
+        for (targets in listOf(emptyList(), (0..AlertDismissal.MAX_BATCH).map { AlertTarget("r$it", "u") }, listOf(AlertTarget("a", "u"), AlertTarget("a", "u"))))
+            assertTrue(runCatching { XapiGateway().dismissAlerts(profile, "pool-id", targets) }.exceptionOrNull() is IllegalArgumentException)
+        assertTrue(calls.none { it == "message.destroy" || it == "message.get_record" })
+        assertTrue(destroyed.isEmpty())
+    }
+
+    @Test fun eventSessionIsOneSeparateSessionWithTheDocumentedCallsAndArguments() = runBlocking {
+        eventPayload = listOf(mapOf("id" to "1", "class" to "vm", "operation" to "mod", "ref" to "vm-ref", "snapshot" to mapOf("uuid" to "vm-id")))
+        val session = XapiGateway().openEvents(profile, "pool-id")
+        val token = session.begin()
+        assertEquals("tok-1", token)
+        val batch = session.next(token, EventPolicy.POLL_TIMEOUT_SECONDS)
+        session.close(); session.close()                                                    // idempotent
+        assertEquals("tok-2", batch.token); assertEquals(listOf(ServerEvent("mod", "vm", "vm-ref")), batch.events)
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "event.from", "event.from", "session.logout"), calls.toList())
+        assertEquals(1, calls.count { it == "session.login_with_password" })              // one login for the whole foreground stay
+        val first = bodies[calls.indexOf("event.from")]
+        assertTrue(first.contains("<array><data><value><string>pool</string></value></data></array>"))
+        assertTrue(first.contains("<string></string>") && first.contains("<double>5.000</double>"))
+        val poll = bodies[calls.lastIndexOf("event.from")]
+        for (cls in EventPolicy.CLASSES) assertTrue(cls, poll.contains("<value><string>$cls</string></value>"))
+        assertTrue(poll.contains("<string>tok-1</string>") && poll.contains("<double>30.000</double>"))
+        assertTrue(agents.all { it == "Meteor-Spark/${BuildConfig.VERSION_NAME}" })
+    }
+    @Test fun aLongPollThatAnswersLateSucceedsBecauseTheReadTimeoutFollowsTheEventTimeout() = runBlocking {
+        val gateway = XapiGateway().apply { eventReadMarginMillis = 3_000 }
+        val session = gateway.openEvents(profile, "pool-id")
+        val token = session.begin()
+        eventDelayMillis = 1_500
+        val started = System.nanoTime()
+        val batch = session.next(token, 1.0)                                                // read timeout 4 s, server answers after 1.5 s
+        assertTrue((System.nanoTime() - started) / 1_000_000 >= 1_400)
+        assertEquals("tok-2", batch.token)
+        session.close()
+    }
+    @Test fun anAnswerLaterThanEventTimeoutPlusMarginFailsAsATransportTimeoutNotAHang() = runBlocking {
+        val gateway = XapiGateway().apply { eventReadMarginMillis = 200 }
+        val session = gateway.openEvents(profile, "pool-id")
+        val token = session.begin()
+        eventDelayMillis = 2_500
+        val failure = runCatching { session.next(token, 0.2) }.exceptionOrNull()                // read timeout 0.4 s, not the 12 s default
+        assertNotNull(failure)
+        assertTrue(generateSequence(failure) { it.cause }.take(8).any { it is java.net.SocketTimeoutException })
+        assertTrue(ErrorReasons.describe(failure!!).contains("did not answer in time"))
+        eventDelayMillis = 0
+        session.close()
+        assertEquals("session.logout", calls.last())
+    }
+    @Test fun cancellingALongPollAbortsTheHttpCallInsteadOfWaitingForIt() = runBlocking {
+        val session = XapiGateway().openEvents(profile, "pool-id")
+        val token = session.begin()
+        eventDelayMillis = 20_000
+        val poll = launch(Dispatchers.Default) { session.next(token, 30.0) }
+        delay(500)
+        val started = System.nanoTime()
+        poll.cancelAndJoin()
+        val millis = (System.nanoTime() - started) / 1_000_000
+        assertTrue("took $millis ms", millis < 5_000)
+        eventDelayMillis = 0
+        session.close()
+        assertEquals("session.logout", calls.last())
+    }
+    @Test fun eventsLostAndSessionInvalidArriveAsTypedFailures() = runBlocking {
+        val session = XapiGateway().openEvents(profile, "pool-id")
+        val token = session.begin()
+        for ((code, kind) in listOf("EVENTS_LOST" to EventFailureKind.EVENTS_LOST, "SESSION_INVALID" to EventFailureKind.SESSION_INVALID)) {
+            rpcErrors = mapOf("event.from" to code)
+            val failure = runCatching { session.next(token, 1.0) }.exceptionOrNull()
+            assertEquals(code, (failure as RpcFailure).code); assertEquals(kind, EventFailures.classify(failure))
+        }
+        rpcErrors = emptyMap(); session.close()
+    }
+    @Test fun openingEventsChecksThePinAndThePoolAndLeavesNoSessionBehind() = runBlocking {
+        assertTrue(runCatching { XapiGateway().openEvents(profile.copy(certificateSha256 = "0".repeat(64)), "pool-id") }.isFailure)
+        assertTrue(calls.isEmpty())
+        assertTrue(runCatching { XapiGateway().openEvents(profile, "other-pool") }.exceptionOrNull() is IllegalArgumentException)
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "session.logout"), calls.toList())
+    }
+
+    @Test fun aPoolMemberLoginFailureCarriesTheMasterAddressAndBecomesAnOfferNotASwitch() = runBlocking {
+        rpcErrors = mapOf("session.login_with_password" to "HOST_IS_SLAVE")
+        rpcParams = mapOf("session.login_with_password" to listOf("192.0.2.10"))
+        val failure = runCatching { XapiGateway().inventory(profile) }.exceptionOrNull() as RpcFailure
+        assertEquals(listOf("session.login_with_password"), calls.toList())               // nothing else was sent to the member
+        assertEquals("HOST_IS_SLAVE", failure.code); assertEquals(listOf("192.0.2.10"), failure.details)
+        val offer = MasterFollow.offer(profile, failure)!!
+        assertEquals("https://192.0.2.10:${server.address.port}/", offer.masterEndpoint)
+        assertEquals(profile.id, offer.draft.id); assertEquals("", offer.draft.certificateSha256)
+        val text = ErrorReasons.describe(failure)
+        assertTrue(text.contains("192.0.2.10") && text.endsWith("(HOST_IS_SLAVE)")); assertFalse(text.contains(profile.password))
+    }
+    @Test fun errorTextsFromTheRealTransportAddTheCodeWithoutLeakingServerParameters() = runBlocking {
+        rpcErrors = mapOf("session.login_with_password" to "SESSION_AUTHENTICATION_FAILED")
+        val auth = runCatching { XapiGateway().inventory(profile) }.exceptionOrNull()!!
+        assertTrue(ErrorReasons.describe(auth).endsWith("(SESSION_AUTHENTICATION_FAILED)"))
+        rpcErrors = mapOf("pool.get_all_records" to "HOST_OFFLINE")
+        val offline = runCatching { XapiGateway().inventory(profile) }.exceptionOrNull()!!
+        val text = ErrorReasons.describe(offline)
+        assertTrue(text.contains("(HOST_OFFLINE)")); assertFalse(text.contains("private argument"))
+        redirect = true; rpcErrors = emptyMap()
+        assertEquals("The server redirected the request. Verify the server address.", ErrorReasons.describe(runCatching { XapiGateway().inventory(profile) }.exceptionOrNull()!!))
+    }
+    // --- end A4 ---
 }

@@ -7,6 +7,8 @@ import androidx.lifecycle.viewModelScope
 import com.meteor.app.data.*
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.CancellationException
@@ -23,13 +25,82 @@ class MeteorViewModel @JvmOverloads constructor(
     private val power = PowerService(gateway, journal)
     private val mutable = MutableStateFlow(MeteorState())
     val state = mutable.asStateFlow()
-    private var detailGeneration = 0L
     private val observations = ObservabilityController(viewModelScope, gateway, mutable)
+    // --- fold3 device findings --- VM detail reads: user-visible loads vs the automatic poll (detailsBusy vs detailsPolling).
+    // A changed power state, host or boot marker also marks A3's read-only VM info stale so it is read again.
+    private val details: DetailsController = DetailsController(viewModelScope, gateway, mutable, { connections.generation }, ::friendly,
+        vmChanged = { authority, uuid -> observations.depth.markVmStale(authority, uuid) })
+    // --- end fold3 device findings ---
 
-    private val connections = ConnectionController(viewModelScope, gateway, vault, journal, inspector, mutable,
-        ::closeDetails, { detailGeneration++ }, ::openDetails, ::friendly, observations::invalidate)
+    // --- A1 ---
+    /** Typed back stack for the shell; lives here so it survives rotation and fold/unfold. */
+    val navigator = com.meteor.app.ui.Navigator()
+    // --- end A1 ---
+
+    private val connections: ConnectionController = ConnectionController(viewModelScope, gateway, vault, journal, inspector, mutable,
+        ::closeDetails, details::invalidate, ::openDetails, ::friendly, observations::invalidate)
+
+    // --- A4 alerts/events ---
+    private val alerts = AlertsController(viewModelScope, gateway, mutable, AlertSeenDataStore(application))
+    private val events = EventController(viewModelScope, gateway, mutable, object : EventActions {
+        // An event-triggered inventory read is skipped when the snapshot is already that fresh.
+        override fun refreshInventory() {
+            val observed = mutable.value.inventory?.observedAtMillis ?: 0
+            if (System.currentTimeMillis() - observed >= EventPolicy.MIN_REFRESH_GAP_MILLIS) connections.refresh()
+        }
+        override fun refreshDetails() = this@MeteorViewModel.refreshDetails()
+        override fun refreshAlerts(deletedMessages: Set<String>, full: Boolean) = alerts.onMessageEvents(deletedMessages, full)
+        override fun refreshActivity() { if (mutable.value.poolActivity != null) observations.refreshActivity() }
+    })
+    // --- end A4 ---
+    // --- B2 storage/host ---
+    /** Snapshots, CD drives, host maintenance and PBD repair. Writes share [power] and its journal. */
+    internal val storageHost = StorageHostController(viewModelScope, gateway, power, mutable, { connections.generation }, ::friendly,
+        ::publishOperation, ::recoverJournalAfterError, ::refresh)
+    // --- end B2 storage/host ---
+
+    // --- B3 background/summary ---
+    private val backgroundAlerts: BackgroundAlertStore = BackgroundAlertDataStore(application)
+    private val pools = PoolSummaryController(viewModelScope, gateway, mutable, AlertSeenDataStore(application))
+    private val hostUpdates = HostUpdateController(viewModelScope, gateway, mutable)
+    /** Set when the user chose "Switch" for a notification's profile, so the completed connection lands on Alerts. */
+    private var alertsAfterConnect: AlertsTarget? = null
+    init {
+        viewModelScope.launch {
+            runCatching { backgroundAlerts.settings.collect { settings -> mutable.update { it.copy(alertNotify = settings) } } }
+        }
+        // A notification's switch offer is spent once its profile is the selected one, however that happened.
+        viewModelScope.launch {
+            mutable.map { it.selectedId }.distinctUntilChanged().collect { id ->
+                if (id != null) mutable.update { if (it.alertsTarget?.profileId == id) it.copy(alertsTarget = null) else it }
+            }
+        }
+    }
+    /** Called once the vault has loaded: preferences of forgotten profiles are removed, and the schedule follows. */
+    private fun backgroundProfilesLoaded() {
+        viewModelScope.launch {
+            mutable.map { it.profiles.map { profile -> profile.id }.toSet() to it.vaultProblem }.distinctUntilChanged().collect { (ids, vaultProblem) ->
+                // Session-only profiles (unreadable vault) never prune stored preferences.
+                if (vaultProblem) return@collect
+                runCatching { backgroundAlerts.retainOnly(ids) }
+                syncBackgroundSchedule()
+            }
+        }
+    }
+    private suspend fun syncBackgroundSchedule() {
+        runCatching { BackgroundAlertScheduler.sync(getApplication(), backgroundAlerts.allSettings().values) }
+    }
+    // --- end B3 ---
 
     init {
+        // --- A4 alerts/events ---
+        // Alerts are read after every inventory snapshot (throttled) and dropped when the connection goes away.
+        viewModelScope.launch {
+            mutable.map { Triple(it.selectedId, it.inventory?.authority, it.inventory?.observedAtMillis) }.distinctUntilChanged()
+                .collect { (id, authority, _) -> if (id == null || authority == null) alerts.invalidate() else alerts.refresh(minGapMillis = 10_000) }
+        }
+        events.start()
+        // --- end A4 ---
         viewModelScope.launch {
             runCatching { preferences.flow.collect { settings -> mutable.update { it.copy(appearance = settings) } } }
                 .onFailure { mutable.update { it.copy(notice = UiNotice.error("Appearance settings could not be read.")) } }
@@ -42,6 +113,7 @@ class MeteorViewModel @JvmOverloads constructor(
                 mutable.update { it.copy(profiles = document.profiles, selectedId = document.selectedId) }
                 loadJournal()
                 connections.initialized = true
+                backgroundProfilesLoaded() // B3 background/summary
                 document.profiles.firstOrNull { it.id == document.selectedId }?.let { connections.connect(it, manual = false) }
                 if (mutable.value.operation?.unresolved == true) checkOperation()
             }.onFailure {
@@ -66,6 +138,10 @@ class MeteorViewModel @JvmOverloads constructor(
     }
     private fun publishOperation(operation: PowerOperation) {
         mutable.update { it.withOperation(operation) }
+        // --- fold3 device findings --- A closed operation on the open VM (a migration, a restart) makes its read-only info stale.
+        if (VmInfoReload.operationClosed(mutable.value.selectedGuest?.uuid, mutable.value.inventory?.authority, operation))
+            observations.depth.markVmStale(operation.authority, operation.vmUuid)
+        // --- end fold3 device findings ---
     }
     fun reloadHistory() {
         if (mutable.value.operationBusy || mutable.value.profileBusy || mutable.value.historyLoading) return
@@ -91,76 +167,117 @@ class MeteorViewModel @JvmOverloads constructor(
     fun cancelTrust() = connections.cancelTrust()
     fun acceptTrust() = connections.acceptTrust()
     fun switchProfile(profile: Profile) = connections.switchProfile(profile)
+    // --- background refresh --- Header Refresh, live events, the fallback poll and post-operation reads: a same-connection
+    // re-read while connected; a full reconnect only when not connected. Explicit connections use switchProfile/acceptTrust.
     fun refresh() = connections.refresh()
-    fun refreshIfStale() = connections.refreshIfStale()
+    // A4: 30 s polling stays the fallback; it lengthens to 90 s while live events are healthy.
+    fun refreshIfStale() = connections.refreshIfStale(if (mutable.value.eventsHealthy) EventPolicy.HEALTHY_STALE_MILLIS else EventPolicy.POLLING_STALE_MILLIS)
     fun disconnect() = connections.disconnect()
     fun forgetProfile(id: String) = connections.forgetProfile(id)
     fun openMetrics(target: MetricTarget) { closeDetails(); observations.openMetrics(target) }
     fun refreshMetrics() = observations.refreshMetrics()
     fun refreshActivity() = observations.refreshActivity()
+    // --- A3 observability ---
+    fun selectHistoryRange(range: HistoryRange?) = observations.depth.selectRange(range)
+    fun refreshHistory() = observations.depth.refreshHistory()
+    fun refreshHistoryIfDue() = observations.depth.refreshHistoryIfDue()
+    fun loadVmInfo(uuid: String) = observations.depth.loadVm(uuid)
+    fun loadHostInfo(uuid: String) = observations.depth.loadHost(uuid)
+    fun loadStorageInfo(uuid: String) = observations.depth.loadStorage(uuid)
+    fun loadNetworks() = observations.depth.loadNetworks()
+    // --- end A3 observability ---
+    // --- A4 alerts/events ---
+    /** Called from the activity lifecycle: live events run only while it is at least STARTED. */
+    fun setForeground(value: Boolean) { mutable.update { if (it.foreground == value) it else it.copy(foreground = value) } }
+    fun refreshAlerts() = alerts.refresh()
+    /** Manual refresh: a full re-read, which also reveals deletions. */
+    fun reloadAlerts() = alerts.refresh(full = true)
+    fun markAlertsSeen() = alerts.markSeen()
+    fun dismissAlerts(messages: List<AlertMessage>) = alerts.dismiss(messages)
+    fun followMaster() = connections.followMaster()
+    fun declineMaster() = connections.declineMaster()
+    // --- end A4 ---
+    // --- B3 background/summary ---
+    /**
+     * Stores one profile's background notification preference. Turning it on starts from now (old alerts are never
+     * notified); turning it off forgets the watermark so a later re-enable starts fresh. The caller has already asked
+     * for POST_NOTIFICATIONS. Session-only profiles cannot be checked in the background, so they cannot opt in.
+     */
+    fun setAlertNotify(profileId: String, requested: AlertNotifySettings) {
+        val current = mutable.value
+        if (current.vaultProblem || current.profiles.none { it.id == profileId }) return
+        val previous = current.alertNotify[profileId] ?: AlertNotifySettings()
+        val next = AlertNotifySettings.change(previous, requested, System.currentTimeMillis())
+        viewModelScope.launch {
+            try {
+                if (AlertNotifySettings.restarts(previous, next)) backgroundAlerts.resetProgress(profileId)
+                backgroundAlerts.setSettings(profileId, next)
+                if (next.enabled) runCatching { AlertChannels.ensure(getApplication()) }
+                syncBackgroundSchedule()
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                mutable.update { it.copy(notice = UiNotice.error("The notification preference could not be saved. Try again.")) }
+            }
+        }
+    }
+    fun refreshAllPools() = pools.refresh()
+    fun refreshAllPoolsIfStale() = pools.refreshIfStale()
+    /** Same as choosing the profile in Connections. */
+    fun openPool(profileId: String) = pools.open(profileId, connections::switchProfile)
+    fun checkHostUpdates(hostUuid: String) = hostUpdates.check(hostUuid)
+    /** A notification tap. It opens Alerts; a different profile is only offered, never connected automatically. */
+    fun openAlertsFor(profileId: String) {
+        navigator.open(com.meteor.app.ui.Destination.Alerts)
+        if (mutable.value.selectedGuest != null) closeDetails() // leaving Fleet stops VM detail polling
+        mutable.update { it.copy(alertsTarget = if (it.selectedId == profileId) null else AlertsTarget(profileId, System.currentTimeMillis())) }
+    }
+    fun switchToAlertsTarget() {
+        val target = mutable.value.alertsTarget ?: return
+        val profile = mutable.value.profiles.firstOrNull { it.id == target.profileId } ?: return
+        alertsAfterConnect = target.copy(requestedAt = System.currentTimeMillis())
+        mutable.update { it.copy(alertsTarget = null) }
+        connections.switchProfile(profile)
+    }
+    fun dismissAlertsTarget() { mutable.update { it.copy(alertsTarget = null) } }
+    /** True once, right after the manual connection that the user started from a notification's switch offer. */
+    fun takeAlertsAfterConnect(): Boolean {
+        val target = alertsAfterConnect ?: return false
+        alertsAfterConnect = null
+        return target.profileId == mutable.value.selectedId && System.currentTimeMillis() - target.requestedAt in 0..120_000
+    }
+    // --- end B3 ---
 
+    /** User-initiated: opening the details, re-opening them and "Refresh details". Shows progress and disables controls while it reads. */
     fun openDetails(guest: Guest) {
         val profile = mutable.value.selectedProfile ?: return
         val authority = mutable.value.inventory?.authority ?: return
         if (guest.poolUuid != authority) return
         mutable.update { it.copy(selectedGuest = guest) }
         if (mutable.value.loading || !mutable.value.connected) return
-        loadDetails(profile, authority, guest.uuid)
+        details.load(profile, authority, guest.uuid)
+        // --- fold3 device findings --- opening or refreshing the VM also reads its read-only info again (A3).
+        observations.depth.markVmStale(authority, guest.uuid)
+        // --- end fold3 device findings ---
+        refreshPermissions(profile) // A2 operations: advisory role read for this connection.
     }
-    private fun loadDetails(profile: Profile, authority: String, uuid: String, action: PowerAction? = null, polling: Boolean = false) {
-        if (mutable.value.operationBusy || mutable.value.profileBusy) return
-        val request = ++detailGeneration
-        val connectionRequest = connections.generation
-        val previous = mutable.value.details
-        mutable.update { it.copy(detailsBusy = true, pendingPower = null,
-            details = it.details?.takeIf { detail -> detail.uuid == uuid && detail.authority == authority }) }
-        viewModelScope.launch {
-            runCatching {
-                (if (polling && action == null && previous != null) gateway.pollDetails(profile, authority, uuid, previous)
-                    else gateway.details(profile, authority, uuid)).also {
-                    require(it.uuid == uuid && it.authority == authority) { "VM identity changed." }
-                }
-            }.onSuccess { detail ->
-                if (request != detailGeneration) return@onSuccess
-                if (connectionRequest != connections.generation || mutable.value.selectedProfile != profile ||
-                    mutable.value.inventory?.authority != authority || !mutable.value.connected) {
-                    closeDetails()
-                    return@onSuccess
-                }
-                mutable.update {
-                    it.copy(detailsBusy = false, details = detail,
-                        pendingPower = action?.takeIf { selected -> PowerRules.eligible(detail, selected) }
-                            ?.let { selected -> PowerConfirmation(profile.id, profile.origin(), detail, selected) },
-                        notice = if (action != null && !PowerRules.eligible(detail, action)) UiNotice.warning("This action is no longer available. VM details were refreshed.") else it.notice)
-                }
-            }.onFailure { error ->
-                if (request == detailGeneration) mutable.update {
-                    it.copy(details = null, detailsBusy = false, pendingPower = null, notice = UiNotice.error(friendly(error)))
-                }
-            }
-        }
-    }
-    fun closeDetails() { detailGeneration++; mutable.update { it.copy(selectedGuest = null, details = null, detailsBusy = false, pendingPower = null) } }
-    fun refreshDetails() {
-        if (mutable.value.pendingPower != null || mutable.value.detailsBusy || mutable.value.loading || !mutable.value.connected) return
-        val current = mutable.value
-        val profile = current.selectedProfile ?: return
-        val detail = current.details ?: return
-        if (current.selectedGuest?.uuid == detail.uuid) loadDetails(profile, detail.authority, detail.uuid, polling = true)
-    }
+    fun closeDetails() { details.close() }
+    /** The automatic refresh (every five seconds, and after an action or event). It never disables a control: see [DetailsController]. */
+    fun refreshDetails() { details.refresh() }
     fun requestPower(action: PowerAction) {
         val state = mutable.value
         if (state.journalProblem || state.operationBusy || state.profileBusy || state.detailsBusy || state.loading || state.operation?.unresolved == true || !state.connected) return
         val detail = state.details ?: return
         val profile = state.selectedProfile ?: return
-        loadDetails(profile, detail.authority, detail.uuid, action)
+        details.load(profile, detail.authority, detail.uuid, action)
     }
     fun cancelPower() { mutable.update { it.copy(pendingPower = null) } }
-    fun confirmPower() {
+    fun confirmPower(typedName: String? = null) {
         val state = mutable.value
-        val confirmation = state.pendingPower ?: return
+        val confirmation = state.pendingPower?.copy(typedName = typedName) ?: return
         val profile = state.selectedProfile ?: return
         if (state.operationBusy || state.profileBusy || state.journalProblem || state.operation?.unresolved == true) return
+        // A2 operations: a typed confirmation that does not match never reaches the service.
+        if (!PowerRules.typedNameMatches(confirmation)) return
         mutable.update { it.copy(pendingPower = null, operationBusy = true) }
         viewModelScope.launch {
             try {
@@ -195,6 +312,9 @@ class MeteorViewModel @JvmOverloads constructor(
     fun reviewOperation() {
         val state = mutable.value
         val operation = state.operation?.takeIf { it.unresolved } ?: return
+        // --- B2 storage/host --- A storage/host record is reviewed from its own object, never by reading a VM.
+        if (operation.targetAction != null && operation.foreign == null) { storageHost.review(operation); return }
+        // --- end B2 storage/host ---
         val profile = state.selectedProfile ?: return
         if (!state.connected || state.loading || state.operationBusy || state.profileBusy || state.journalProblem) return
         mutable.update { it.copy(operationBusy = true, pendingPower = null, pendingReview = null) }
@@ -218,6 +338,57 @@ class MeteorViewModel @JvmOverloads constructor(
             finally { mutable.update { it.copy(operationBusy = false) } }
         }
     }
+    // --- A2 operations ---
+    /** Reads hosts fresh for a host-targeted kind. Choosing one re-reads the VM before confirmation. */
+    fun requestHostChoice(action: PowerAction) {
+        val state = mutable.value
+        if (action.hostTarget == HostTarget.NONE || state.hostChoiceBusy) return
+        if (state.journalProblem || state.operationBusy || state.profileBusy || state.detailsBusy || state.loading || state.operation?.unresolved == true || !state.connected) return
+        val detail = state.details?.takeIf { PowerRules.eligible(it, action) } ?: return
+        val profile = state.selectedProfile ?: return
+        val connectionRequest = connections.generation
+        mutable.update { it.copy(hostChoiceBusy = true, pendingHostChoice = null) }
+        viewModelScope.launch {
+            try {
+                val hosts = gateway.hostChoices(profile, detail.authority, detail.uuid)
+                // Display polling may refresh the same VM meanwhile; only a closed VM or changed connection drops the result.
+                if (connectionRequest == connections.generation && mutable.value.selectedProfile == profile &&
+                    mutable.value.details?.let { it.uuid == detail.uuid && it.authority == detail.authority } == true) mutable.update {
+                    it.copy(pendingHostChoice = HostChoiceRequest(action, detail.authority, detail.uuid,
+                        hosts.firstOrNull { host -> host.resident }?.uuid ?: detail.residentHostUuid, hosts, System.currentTimeMillis()))
+                }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                mutable.update { it.copy(notice = UiNotice.error(friendly(error))) }
+            } finally { mutable.update { it.copy(hostChoiceBusy = false) } }
+        }
+    }
+    fun cancelHostChoice() { mutable.update { it.copy(pendingHostChoice = null) } }
+    fun chooseHost(host: HostChoice) {
+        val state = mutable.value
+        val choice = state.pendingHostChoice ?: return
+        val profile = state.selectedProfile
+        val detail = state.details?.takeIf { it.uuid == choice.vmUuid && it.authority == choice.authority }
+        if (profile == null || detail == null || host !in PowerRules.hostCandidates(choice.action, choice.hosts, choice.residentHostUuid)) {
+            mutable.update { it.copy(pendingHostChoice = null) }
+            return
+        }
+        // A blocked tap keeps the picker open (its buttons are disabled meanwhile) instead of silently dropping the choice.
+        if (state.journalProblem || state.operationBusy || state.profileBusy || state.detailsBusy || state.loading || state.operation?.unresolved == true || !state.connected) return
+        mutable.update { it.copy(pendingHostChoice = null) }
+        details.load(profile, detail.authority, detail.uuid, choice.action, target = host)
+    }
+    private fun refreshPermissions(profile: Profile) {
+        val origin = profile.origin()
+        viewModelScope.launch {
+            val permissions = try { gateway.permissions(profile) } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                SessionPermissions.unavailable("read failed")
+            }
+            if (mutable.value.selectedProfile == profile) mutable.update { it.copy(permissionView = PermissionView(profile.id, origin, permissions)) }
+        }
+    }
+    // --- end A2 operations ---
     private fun friendlyReview(error: Throwable): String =
         if (error is IllegalArgumentException) error.message ?: "Read the original VM and review the action again." else friendly(error)
     private suspend fun recoverJournalAfterError(error: Throwable) {
@@ -259,18 +430,81 @@ class MeteorViewModel @JvmOverloads constructor(
     }
     fun dismissMessage() { mutable.update { it.copy(notice = null) } }
 
-    private fun friendly(error: Throwable): String {
-        val causes = generateSequence(error) { it.cause }.take(8).toList()
-        return when {
-            causes.any { it is CertificateChanged } -> "The server certificate changed. Verify its fingerprint before connecting again."
-            causes.any { it is java.security.cert.CertificateExpiredException } -> "The server certificate has expired. Renew it on the server, then review its fingerprint before connecting."
-            causes.any { it is java.security.cert.CertificateNotYetValidException } -> "The server certificate is not valid yet. Check the device clock and server certificate."
-            error is RpcFailure && error.code == "SESSION_AUTHENTICATION_FAILED" -> "Authentication failed. Check this profile's username and password."
-            error is RpcFailure && error.code == "HOST_IS_SLAVE" -> "This address is a pool member. Connect to the pool coordinator."
-            error is RpcFailure -> "The server refused this request (${error.code})."
-            error is GatewayError && error.reason == "redirect-refused" -> "The server redirected the request. Verify the server address."
-            else -> "Could not refresh securely. Check server reachability, certificate validity, and permissions."
+    // --- B1 console ---
+    private var consoleOrigin: String? = null
+    /** The one open console. Held here so its session survives rotation and fold/unfold. */
+    val console = ConsoleController(viewModelScope,
+        opener = { profile, target, encodings -> gateway.console(profile, target.authority, target.vmUuid, encodings) },
+        profileOf = { id -> mutable.value.profiles.firstOrNull { it.id == id } },
+        approvePin = { profileId, authority, pin -> connections.approveMemberPin(profileId, authority, pin) })
+
+    init {
+        // The console follows the shell: disconnecting, switching profile or pool, or forgetting the profile closes it.
+        viewModelScope.launch {
+            mutable.map { state -> state.selectedProfile?.let { it.id to it.origin() } to state.inventory?.authority }
+                .distinctUntilChanged().collect { (profile, authority) -> closeConsoleIfStale(profile, authority) }
+        }
+        // Leaving the console destination, by any route, closes the session and returns to the VM it came from.
+        viewModelScope.launch {
+            var previous: com.meteor.app.ui.Destination.Console? = null
+            navigator.stack.collect { stack ->
+                val now = stack.current as? com.meteor.app.ui.Destination.Console
+                if (now == null) {
+                    console.close()
+                    previous?.let { left -> if (stack.current == com.meteor.app.ui.Destination.Fleet) reopenDetails(left) }
+                }
+                previous = now
+            }
+        }
+        // Device finding: returning from VM performance to the fleet reopens the VM it was opened from, as the console does.
+        viewModelScope.launch {
+            var previous: com.meteor.app.ui.Destination? = null
+            navigator.stack.collect { stack ->
+                val now = stack.current
+                if (previous == com.meteor.app.ui.Destination.Performance && now == com.meteor.app.ui.Destination.Fleet) {
+                    val state = mutable.value
+                    val target = state.metricTarget?.takeIf { it.kind == MetricKind.VM }
+                    if (target != null && state.selectedGuest == null)
+                        state.inventory?.guests?.firstOrNull { it.uuid == target.uuid && it.poolUuid == target.authority }?.let(::openDetails)
+                }
+                previous = now
+            }
         }
     }
+
+    /** Opens the full-screen console for a VM whose details are loaded. A console never journals or sends a power action. */
+    fun openConsole(guest: Guest, detail: VmDetails) {
+        val state = mutable.value
+        val profile = state.selectedProfile ?: return
+        if (!state.connected || detail.uuid != guest.uuid || detail.authority != guest.poolUuid || detail.authority != state.inventory?.authority) return
+        val target = ConsoleTarget(profile.id, detail.authority, detail.uuid, detail.name)
+        consoleOrigin = profile.origin()
+        // The details dialog would otherwise stay above the console, and its polling would keep running.
+        closeDetails()
+        console.open(target)
+        navigator.open(com.meteor.app.ui.Destination.Console(target.profileId, target.authority, target.vmUuid, target.vmName))
+    }
+
+    private fun closeConsoleIfStale(profile: Pair<String, String>?, authority: String?) {
+        val target = console.state.value.target ?: return
+        val stale = profile == null || profile.first != target.profileId || consoleOrigin?.let { it != profile.second } == true ||
+            (authority != null && authority != target.authority)
+        if (!stale) return
+        console.close()
+        if (navigator.current is com.meteor.app.ui.Destination.Console) navigator.back()
+    }
+
+    private fun reopenDetails(left: com.meteor.app.ui.Destination.Console) {
+        mutable.value.inventory?.guests?.firstOrNull { it.uuid == left.vmUuid && it.poolUuid == left.authority }?.let(::openDetails)
+    }
+
+    override fun onCleared() {
+        console.shutdown()
+        super.onCleared()
+    }
+    // --- end B1 console ---
+
+    // A4: the wording lives in ErrorReasons so it can be tested on the JVM; it adds the raw XAPI code or gateway reason.
+    private fun friendly(error: Throwable): String = ErrorReasons.describe(error)
 }
 

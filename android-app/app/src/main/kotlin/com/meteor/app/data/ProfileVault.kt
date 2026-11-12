@@ -51,16 +51,13 @@ class ProfileVault(
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE).build())
         }.generateKey()
     }
-    private fun profile(json: JSONObject) = Profile(
-        json.getString("id"), json.getString("label"), Endpoints.normalize(json.getString("endpoint")),
-        json.getString("username"), json.getString("password"), json.getString("certificateSha256"),
-    ).also {
-        require(it.certificateSha256.matches(Regex("[0-9a-f]{64}")))
-        require(it.id.isNotBlank() && it.username.isNotBlank())
+    // --- B1 console --- Field mapping lives in ProfileCodec (JVM-tested); it adds the optional `memberPins` object.
+    private fun JSONObject.plain(): Map<String, Any?> = keys().asSequence().associateWith { key ->
+        get(key).let { value -> if (value is JSONObject) value.plain() else value }
     }
-    private fun json(profile: Profile) = JSONObject().put("id", profile.id).put("label", profile.label)
-        .put("endpoint", profile.endpoint).put("username", profile.username)
-        .put("password", profile.password).put("certificateSha256", profile.certificateSha256)
+    private fun profile(json: JSONObject) = ProfileCodec.fromMap(json.plain())
+    private fun json(profile: Profile) = JSONObject(ProfileCodec.toMap(profile))
+    // --- end B1 console ---
 
     override suspend fun load(): ProfileDocument = withContext(Dispatchers.IO) {
         if (!file.baseFile.exists() && !File(file.baseFile.path + ".bak").exists()) return@withContext ProfileDocument()
