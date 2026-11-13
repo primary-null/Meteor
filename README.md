@@ -10,7 +10,7 @@
 
 ## Download and install
 
-Signed downloads appear on the **[Releases page](https://github.com/primary-null/Meteor/releases)**. Meteor needs Android 12 (API 31) or newer.
+**No signed APK has been published yet.** Once the first release is signed and published, its APK will appear on the **[Releases page](https://github.com/primary-null/Meteor/releases)**. Meteor needs Android 12 (API 31) or newer.
 
 1. On your phone, open the [Releases page](https://github.com/primary-null/Meteor/releases) and the newest release.
 2. Under **Assets**, download `Meteor-<version>.apk` (for example `Meteor-1.10.apk`). Ignore *Source code (zip)* and *(tar.gz)*: they are not installable. The GitHub Actions run artifacts are build output for developers and need a signed-in GitHub account.
