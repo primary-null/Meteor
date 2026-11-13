@@ -341,6 +341,15 @@ class ToolchainTests(unittest.TestCase):
                             "--ks-pass", "env:METEOR_TEST_STORE_PW", "--out-dir", out_dir,
                             "--pin-file", self.tmp / "no-such-pin", *extra)
 
+    def test_real_apksigner_output_parses(self):
+        signed = self.tmp / "parser-probe.apk"
+        with mock.patch.dict(os.environ, self.env):
+            release.sign_apk(self.tools, self.good, signed, self.release_key, "key", "env:METEOR_TEST_STORE_PW")
+        verdict = release.run([self.tools["apksigner"], "verify", "--verbose", "--print-certs-pem", signed])
+        self.assertEqual(0, verdict.returncode, verdict.stderr)
+        self.assertEqual(1, len(release.parse_apksigner(verdict.stdout)["signers"]),
+                         f"{self.tools['apksigner']} output:\n{verdict.stdout}\n{verdict.stderr}")
+
     def test_unsigned_build_is_accepted_and_defects_are_not(self):
         self.assertEqual(0, self.run_cli("verify", "--unsigned", self.good)[0])
         for label, kwargs in {"debuggable": {"attributes": 'android:debuggable="true"'},
