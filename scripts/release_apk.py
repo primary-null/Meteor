@@ -102,16 +102,24 @@ def parse_apksigner(text):
     schemes = {m.group(1): m.group(2) == "true"
                for m in re.finditer(r"^Verified using (v[\d.]+) scheme[^:]*: (true|false)", text, re.M)}
     signers = {}
-    for found in re.finditer(r"^Signer #(\d+) certificate (DN|SHA-256 digest): (.*)$", text, re.M):
-        signers.setdefault(int(found.group(1)), {})[found.group(2)] = found.group(3).strip()
+    # New build-tools label v3 signers by SDK range instead of "Signer #1".
+    # Preserve output order so each PEM remains paired with its own certificate.
+    for found in re.finditer(
+            r"^(Signer (?:#\d+|\(minSdkVersion=[^\r\n]+\))) certificate (DN|SHA-256 digest): (.*)$",
+            text, re.M):
+        signers.setdefault(found.group(1), {})[found.group(2)] = found.group(3).strip()
     pems = re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", text, re.S)
     ordered = []
-    for index in sorted(signers):
-        row = signers[index]
+    for row in signers.values():
         ordered.append({"dn": row.get("DN", ""), "sha256": row.get("SHA-256 digest", "").lower().replace(":", "")})
     for row, pem in zip(ordered, pems):
         row["notAfter"] = cert_not_after(base64.b64decode("".join(pem.split()))).isoformat()
-    return {"schemes": schemes, "signers": ordered}
+    # v3 and v3.1 can report the same certificate for separate SDK ranges.
+    unique = []
+    for row in ordered:
+        if row not in unique:
+            unique.append(row)
+    return {"schemes": schemes, "signers": unique}
 
 
 def _der_children(buf, start, end):

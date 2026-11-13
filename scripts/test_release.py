@@ -109,6 +109,21 @@ class ParserTests(unittest.TestCase):
         parsed = release.parse_apksigner("ERROR: Missing META-INF/MANIFEST.MF\n")
         self.assertEqual({"schemes": {}, "signers": []}, parsed)
 
+    def test_apksigner_sdk_range_labels_and_repeated_certificate(self):
+        text = APKSIGNER.format(pem=LONG_PEM)
+        first = text.replace("Signer #1", "Signer (minSdkVersion=28, maxSdkVersion=2147483647)")
+        second = text[text.index("Signer #1 certificate DN:"):].replace(
+            "Signer #1", "Signer (minSdkVersion=33 (dev release=true), maxSdkVersion=2147483647)")
+        parsed = release.parse_apksigner(first + second)
+        self.assertEqual(release.parse_apksigner(text), parsed)
+
+    def test_apksigner_different_sdk_range_signers_remain_distinct(self):
+        first = APKSIGNER.format(pem=LONG_PEM).replace(
+            "Signer #1", "Signer (minSdkVersion=28, maxSdkVersion=32)")
+        second = APKSIGNER.format(pem=SHORT_PEM).replace(
+            "Signer #1", "Signer (minSdkVersion=33, maxSdkVersion=2147483647)").replace(PIN.upper(), "A" * 64)
+        self.assertEqual(2, len(release.parse_apksigner(first + second)["signers"]))
+
     def test_elf_alignment(self):
         def elf(align):
             header = bytearray(64)
