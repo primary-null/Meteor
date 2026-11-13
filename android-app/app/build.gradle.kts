@@ -24,6 +24,10 @@ android {
         release {
             isMinifyEnabled = false
             proguardFiles(getDefaultProguardFile("proguard-android-optimize.txt"), "proguard-rules.pro")
+            // The release output is deliberately unsigned: the release key never enters Gradle.
+            // scripts/release_apk.py signs it afterwards (docs/RELEASING.md). Keep repository
+            // details such as a remote URL out of the APK, whichever machine builds it.
+            vcsInfo.include = false
         }
         create("candidate") {
             initWith(getByName("release"))

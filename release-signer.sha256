@@ -1,0 +1,10 @@
+# SHA-256 fingerprint of the certificate that signs official Meteor release APKs.
+#
+# This is public information. It pins the signer: the release workflow and
+# scripts/release_apk.py refuse to publish an APK whose signing certificate does
+# not match, so a wrong or substituted key cannot ship by accident. Users can
+# compare it with `apksigner verify --print-certs Meteor-<version>.apk`.
+#
+# Put exactly one fingerprint below (64 hex digits; colons and letter case are
+# ignored) when the release key is created, before the first release. See
+# docs/RELEASING.md. While the line is missing, releases are blocked.

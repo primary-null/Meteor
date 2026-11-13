@@ -2,11 +2,35 @@
 
 **A native Android client for XCP-ng.** Meteor connects directly to a pool's XAPI over certificate-pinned HTTPS and shows hosts, virtual machines, storage, networks and alerts on your phone. You can run VM, snapshot, host and storage operations, open a VM console and follow performance history, and every operation goes through a write-ahead journal that never repeats a command it cannot verify.
 
-> **Status:** in active development (1.10). Direct XAPI inventory, VM and host operations, snapshots, ISO media, storage repair, the VM console, performance history, alerts and optional background alert notifications are implemented and covered by offline tests; live-server acceptance on XCP-ng 8.3 remains separate. Xen Orchestra connections are planned but not implemented. Meteor is not published to an app store, and release builds are unsigned.
+> **Status:** in active development (1.10). Direct XAPI inventory, VM and host operations, snapshots, ISO media, storage repair, the VM console, performance history, alerts and optional background alert notifications are implemented and covered by offline tests; live-server acceptance on XCP-ng 8.3 remains separate. Xen Orchestra connections are planned but not implemented. Meteor is not on an app store; signed APKs, once published, are distributed through [GitHub Releases](https://github.com/primary-null/Meteor/releases) and early builds are marked *Pre-release* there.
 
 <p align="center">
   <img src="design/assets/silver-hybrid.png" alt="Meteor icon artwork" width="160">
 </p>
+
+## Download and install
+
+Signed downloads appear on the **[Releases page](https://github.com/primary-null/Meteor/releases)**. Meteor needs Android 12 (API 31) or newer.
+
+1. On your phone, open the [Releases page](https://github.com/primary-null/Meteor/releases) and the newest release.
+2. Under **Assets**, download `Meteor-<version>.apk` (for example `Meteor-1.10.apk`). Ignore *Source code (zip)* and *(tar.gz)*: they are not installable. The GitHub Actions run artifacts are build output for developers and need a signed-in GitHub account.
+3. Open the downloaded file. When Android asks, allow your browser or file manager to **install unknown apps**, then tap **Install**. You can switch that permission off again afterwards (Settings, Apps, Special app access, Install unknown apps).
+4. Open Meteor and follow [Using it](#using-it).
+
+If the install is blocked, check that the permission above is on for the app you opened the file from. On phones where Android's [developer verification](https://developer.android.com/developer-verification/guides) applies, an app from an unregistered developer needs the extra steps Android shows.
+
+**Check the download (recommended).** Each release lists the APK's SHA-256 and the signing certificate's SHA-256 in its notes and attaches `SHA256SUMS.txt`. The signer's fingerprint is also committed in [`release-signer.sha256`](release-signer.sha256).
+
+- `sha256sum -c SHA256SUMS.txt` (Windows PowerShell: `Get-FileHash Meteor-<version>.apk`) must match the checksum.
+- `apksigner verify --print-certs Meteor-<version>.apk` (`apksigner` is part of the Android SDK Build-Tools) must report one signer whose *certificate SHA-256 digest* equals that fingerprint.
+
+If either differs, do not install the file.
+
+**Update.** Install the newer APK over the old one. Every release has the application ID `com.meteor.app` and the same signing key, so Android updates it in place and keeps your saved connections, certificate pins and action history. **Do not uninstall first.** Android will not install an older version over a newer one.
+
+If Android reports a conflict with an existing package, the installed copy was signed with a different key, for example a build you made yourself. Uninstalling it removes Meteor's saved connections (they are kept out of backups by design), so note your connection details first. Debug (`com.meteor.app.debug`) and candidate (`com.meteor.app.candidate`) builds use their own IDs and install beside the release.
+
+Maintainers: [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Features
 
@@ -105,9 +129,9 @@ android-app/                Gradle project (single :app module)
   app/src/test/             JVM unit tests, including a real loopback HTTPS/XAPI fixture
   app/src/androidTest/      Offline instrumentation tests (vault, journal, UI journeys, races)
 meteor_logic/               Python reference model and its tests
-scripts/                    Repository checks: source guard and version helper
+scripts/                    Repository checks: source guard, version helper and release signing/verification
 design/                     Interactive HTML design studies
-docs/                       Architecture notes
+docs/                       Architecture notes and the release guide
 ```
 
 ## Build and test
@@ -123,11 +147,13 @@ From the repository root:
 
 ```sh
 python scripts/source_guard.py                         # blocks private-key headers, GitHub tokens, credential/keystore files and build artefacts
-python -m unittest discover -s scripts -p test_safety.py
+python -m unittest discover -s scripts -p "test_*.py"  # safety and release-script tests (signing tests need the SDK build-tools and a JDK)
 python -m unittest meteor_logic.test_core              # reference-model tests
 ```
 
 The JVM unit tests need no device or network. The transport tests start a local HTTPS server with a temporary self-signed certificate. CI ([`.github/workflows/validate.yml`](.github/workflows/validate.yml)) runs all of the above on Ubuntu and needs no secrets.
+
+`./gradlew :app:assembleRelease` produces an **unsigned** APK, which Android will not install. Signed releases come from the [Release workflow](.github/workflows/release.yml), which builds on GitHub's runners and signs outside Gradle with a pinned key; see [docs/RELEASING.md](docs/RELEASING.md).
 
 Instrumentation tests in `app/src/androidTest` run offline with synthetic storage against a release-like build type (`candidate`, application ID `com.meteor.app.candidate`) that installs alongside a debug build. Some tests deliberately corrupt their own files, so run them on an emulator:
 
@@ -147,7 +173,7 @@ Meteor is meant for private networks or a VPN. It does not expose any listening 
 
 - Live-server acceptance of the 1.10 operations on XCP-ng 8.3
 - Xen Orchestra (REST) connections alongside direct XAPI, for backups, restore and replication
-- Production release signing and store packaging
+- Store packaging beyond GitHub Releases
 
 ## License
 

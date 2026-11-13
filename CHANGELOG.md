@@ -2,7 +2,7 @@
 
 ## 1.10 — Android delivery 17
 
-Minor increment: useful new capabilities on the existing direct-XAPI product. Journal and profile documents keep version 1 and gain only optional keys, so 1.9 data loads unchanged; an older build that meets a new operation kind keeps it locked instead of discarding it. Development signing and offline checks do not imply production or live-server acceptance. No Xen Orchestra adapter in this release.
+Minor increment: useful new capabilities on the existing direct-XAPI product. Journal and profile documents keep version 1 and gain only optional keys, so 1.9 data loads unchanged; an older build that meets a new operation kind keeps it locked instead of discarding it. Offline checks do not imply live-server acceptance. No Xen Orchestra adapter in this release.
 
 - Add typed navigation with system Back, a navigation rail and list-detail panes for medium and expanded widths such as foldable inner displays, and state that survives folding and unfolding. Split the UI into per-screen files.
 - Generalize the journaled power model into an operation framework and add forced shutdown and reboot, suspend and resume, pause and unpause, start on a chosen host and live migration within the pool. Disruptive kinds require typing the VM name; role limits are explained before sending.
@@ -12,6 +12,7 @@ Minor increment: useful new capabilities on the existing direct-XAPI product. Jo
 - Add the VM console as a full-screen destination with compressed encodings, zoom, special keys, keyboard and pointer input, view-only mode and member-host certificate trust.
 - Add opt-in background alert notifications (WorkManager, read-only), an All pools summary and a manual, read-only host update check.
 - Device testing on a foldable phone against a simulated pool led to these corrections: background inventory refreshes no longer drop the connection, clear open confirmations or rewrite saved profiles; detail polling no longer disables controls; closed operation cards stop pinning above every screen; timestamps are localized; long names ellipsize; the console toolbar respects display insets; disabled buttons look disabled and carry a reason; returning from VM performance reopens the VM; VM actions keep a stable position when the VM's state changes.
+- Distribute signed APKs on GitHub Releases. The release build stays unsigned; a tag-triggered workflow builds it on GitHub's runners and `scripts/release_apk.py` signs and checks it (package, version, debuggable and test-only flags, 16 KB alignment, pinned signer fingerprint) outside Gradle. Releases are drafted for review and never published automatically. The release APK no longer carries repository metadata. The README documents download, verification and in-place updates; see `docs/RELEASING.md`.
 - Checks: source guard, Python reference tests, debug build, lint, instrumentation test compilation and 599 JVM tests, including loopback pinned-HTTPS XAPI fixtures.
 
 ## 1.9 validation build — Android delivery 13
