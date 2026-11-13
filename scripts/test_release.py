@@ -117,6 +117,13 @@ class ParserTests(unittest.TestCase):
         parsed = release.parse_apksigner(first + second)
         self.assertEqual(release.parse_apksigner(text), parsed)
 
+    def test_apksigner_build_tools_37_labels(self):
+        text = APKSIGNER.format(pem=LONG_PEM)
+        current = text.replace("Signer #1", "V3.0 Signer:")
+        duplicate = text[text.index("Signer #1 certificate DN:"):].replace("Signer #1", "V3.1 Signer:")
+        stamp = text[text.index("Signer #1 certificate DN:"):].replace("Signer #1", "Source Stamp Signer:")
+        self.assertEqual(release.parse_apksigner(text), release.parse_apksigner(current + duplicate + stamp))
+
     def test_apksigner_different_sdk_range_signers_remain_distinct(self):
         first = APKSIGNER.format(pem=LONG_PEM).replace(
             "Signer #1", "Signer (minSdkVersion=28, maxSdkVersion=32)")

@@ -102,10 +102,11 @@ def parse_apksigner(text):
     schemes = {m.group(1): m.group(2) == "true"
                for m in re.finditer(r"^Verified using (v[\d.]+) scheme[^:]*: (true|false)", text, re.M)}
     signers = {}
-    # New build-tools label v3 signers by SDK range instead of "Signer #1".
+    # Build-tools 37 uses "V3.0 Signer:"; other versions use SDK ranges
+    # or "Signer #1". Source Stamp Signer is deliberately excluded.
     # Preserve output order so each PEM remains paired with its own certificate.
     for found in re.finditer(
-            r"^(Signer (?:#\d+|\(minSdkVersion=[^\r\n]+\))) certificate (DN|SHA-256 digest): (.*)$",
+            r"^((?:Signer (?:#\d+|\(minSdkVersion=[^\r\n]+\))|V\d+(?:\.\d+)? Signer(?: #\d+)?):?) certificate (DN|SHA-256 digest): (.*)$",
             text, re.M):
         signers.setdefault(found.group(1), {})[found.group(2)] = found.group(3).strip()
     pems = re.findall(r"-----BEGIN CERTIFICATE-----(.*?)-----END CERTIFICATE-----", text, re.S)
