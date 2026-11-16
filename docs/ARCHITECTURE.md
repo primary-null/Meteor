@@ -177,8 +177,7 @@ android-app/                Gradle project (single :app module)
   app/src/androidTest/      Offline instrumentation tests (vault, journal, UI journeys, races)
 meteor_logic/               Python reference model and its tests
 scripts/                    Repository checks: source guard, version helper and release signing/verification
-design/                     Interactive HTML design studies
-docs/                       Architecture notes and the release guide
+docs/                       Install, features, architecture, release guide and screenshots
 ```
 
 ## Build and test in detail

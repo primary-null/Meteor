@@ -3,7 +3,7 @@
 **A native Android client for XCP-ng.** Meteor connects straight to a pool over certificate-pinned HTTPS, so you can watch and run your hosts and virtual machines from a phone, foldable or tablet. No extra server, agent or account.
 
 <p align="center">
-  <img src="design/assets/silver-hybrid.png" alt="Meteor icon artwork" width="140">
+  <img src="docs/icon.png" alt="Meteor icon artwork" width="140">
 </p>
 
 > **Status: in development (1.11).** Built for XCP-ng 8.3. Inventory, the console, performance, alerts and settings editing have been run against a real host; snapshots, migration and host maintenance are tested offline only so far. No signed APK is published yet, so for now you build it yourself.
