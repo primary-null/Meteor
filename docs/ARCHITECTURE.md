@@ -106,3 +106,110 @@ A standard-library Python model of the connection and operation rules, with an S
 | Inventory at 300, 1,000 and 5,000 VM records, generated from the recorded records | `InventoryScaleTest` | JVM, in CI |
 | Keystore vault, journal files, icon import, ViewModel races, Compose UI journeys, alerts and detail screens | `app/src/androidTest` | Android emulator (`candidate` build type) |
 | Domain rules, independent of Android | `meteor_logic/test_core.py` | Python, in CI |
+
+## Design notes
+
+Meteor is a single-activity Kotlin / Jetpack Compose app with a deliberately small dependency surface. Networking, XML-RPC and storage are implemented on platform APIs, with no third-party HTTP or crypto libraries.
+
+### Pinned HTTPS to XAPI
+
+XCP-ng hosts usually serve self-signed certificates, so Meteor replaces CA trust with an explicit, user-approved **leaf certificate pin** (`ServerTrust`, `XapiGateway.kt`):
+
+- Certificate inspection completes a TLS handshake and reads the leaf certificate **without sending credentials**.
+- Every later request requires the exact SHA-256 pin, a currently valid certificate and the expected hostname. A changed certificate fails with a distinct `CertificateChanged` error, so the UI can ask you to verify again rather than reporting a generic failure.
+- Redirects are refused, responses are capped at 8 MiB (the inventory's VM list is instead parsed as a stream, with its own limits sized from real record costs), and only `https://host[:port]/` endpoints without paths, queries or embedded credentials are accepted. Cleartext traffic is disabled for the whole app.
+- The XML-RPC parser (`XmlRpc.kt`) rejects DTDs and entities, limits nesting depth and node count, rejects duplicate struct fields, and turns XAPI failures into error codes without echoing server-supplied arguments.
+- Foreground calls share one XAPI session per connected profile (`SessionReuse.kt`), bound to that profile's endpoint, username, password and pin, and logged out on disconnect, on any identity change and after two minutes in the background. A read answered `SESSION_INVALID` logs in once and is repeated once. A write is never repeated, never sent on a kept-alive connection, and not started if its caller was already cancelled. Background checks, the event long-poll and consoles keep their own sessions.
+
+### Encrypted connection profiles
+
+Profiles (endpoint, username, password and pin) are stored in a single **AES-256-GCM** document. The key is generated in and never leaves the **Android Keystore** (`ProfileVault.kt`):
+
+- Versioned file header, random IV per write, authenticated associated data, atomic writes (`AtomicFile`) and size-bounded reads.
+- A corrupt or unreadable vault is left untouched. Meteor falls back to session-only connections instead of overwriting the data.
+- App data is excluded from cloud backup and device transfer, and `Profile.toString()` redacts credentials.
+- Renaming preserves the profile ID, credentials and pin. Leave the password empty when editing to keep it; credential changes use the saved pin. A different server address or renewed certificate requires explicit trust review.
+- Disconnect clears the active selection so polling stops and the next launch stays disconnected when that selection can be saved. Forgetting checks the entire operation journal, blocks removal of an unresolved action's original profile and retains closed history. Storage failures preserve existing data and are reported explicitly.
+
+### Journaled operations with safe uncertain-outcome handling
+
+Every state-changing operation (VM power and placement, VM settings, snapshots, CD media, host maintenance and storage repair) is designed around one rule: **a command whose outcome is unknown is never sent again automatically** (`Power.kt`, `VmOperations.kt`, `TargetOperations.kt`, `OperationJournal.kt`).
+
+1. **Confirm against fresh state.** Pressing an action re-reads the VM. The confirmation expires after 30 seconds and is rejected if the connection, pool, VM, power state or boot time changed in the meantime.
+2. **Write ahead.** The operation is journaled as `PREPARED`, then `SUBMITTING`, *before* the request leaves the device. A single process-wide lock and a "no unresolved operation" check prevent concurrent or duplicate sends.
+3. **Track the server task.** The returned task reference and UUID are journaled as soon as they arrive. If a disk write fails, the ticket is kept in memory so a later status check can still persist it.
+4. **Verify by read-back.** Task success alone is not enough. Meteor re-reads the target and requires the expected result: the expected power state, the VM on the chosen host, the new snapshot present, the host disabled. A reboot also requires a *changed*, valid boot timestamp.
+5. **Classify failures honestly.** An explicit XAPI rejection before a task exists is a definite failure. A lost response, timeout or crash after sending is recorded as `UNKNOWN`. The one retry is for calls whose signature differs between XAPI versions: only an explicit `MESSAGE_PARAMETER_COUNT_MISMATCH`, which proves the call never ran, permits sending it once with the other signature.
+6. **Recover by observing only.** *Check status* re-reads the original pool and VM through the original trusted connection and resumes watching the saved task. Recovery code has no path to `submit`.
+7. **Manual review as a last resort.** If the task can't be found, you can review the record. Meteor reads the original VM again, refuses while any VM operation is active, asks you to confirm that you checked the server's task history, and re-reads once more before closing. The closed record keeps the original action and its **unverified** outcome. It is never reported as a success.
+
+VM settings use synchronous calls that return no task, so each setter is its own journaled step: the value is read just before sending, the single call is sent, and success is the requested value read back (`VmSettings.kt`). A lost reply is never resent. Only error codes the server raises before it writes anything count as a definite rejection; everything else is decided by the read-back.
+
+While an operation is unresolved, new operations stay locked, but connections can still be repaired or added so you can investigate. A record whose VM was deleted on the server, or that an older build cannot interpret, can be closed after manual review instead of locking the app. Journal and profile documents remain version 1 and only gained optional keys, so data from earlier releases loads unchanged; an older build that meets an operation kind it does not know keeps it locked instead of discarding it.
+
+### Responsive and race-safe UI
+
+- Connection forms account for the software keyboard, keep lower fields and buttons reachable, and dismiss it when a form is submitted or cancelled.
+- Typed destinations and a back stack (`Navigation.kt`) drive system Back. Width classes choose between the phone layout and a navigation rail with list-detail panes (`Adaptive.kt`).
+- Background inventory refreshes keep the connection, open details and pending confirmations in place, and are fenced like every other request.
+- `MeteorViewModel` uses generation counters to discard stale inventory and detail responses. When you switch connections or VMs quickly, the latest request wins, and a detail response from another connection is never shown, even if both point at the same pool.
+- The UI refreshes inventory and open VM details only while the app is visible (`repeatOnLifecycle`).
+- Automatic detail polling reuses display-only disk/network topology for up to 60 seconds. Power, boot time, allowed operations and active operations are always read anew. Explicit refresh and every power confirmation/verification read bypass this reuse.
+- Connection coordination and certificate inspection are independently testable on the JVM. Informational notices, warnings and errors have separate presentation.
+
+### Read-only observability
+
+`ObservabilityController` fences requests by profile, connection origin, pool, object and generation. Switching connection/pool or disconnecting clears observations; read failures mark displayed data as last known. `MetricWindow` bounds memory, preserves gaps and resets on clock rollback or target change. The active page polls only while the app is visible.
+
+The gateway uses XAPI's [VM](https://xapi-project.github.io/xen-api/classes/vm.html) and [host](https://xapi-project.github.io/xen-api/classes/host.html) `get_data_sources` as a catalogue and `query_data_source` for current values (a real server reports no values in the catalogue), plus read-only [task](https://xapi-project.github.io/xen-api/classes/task.html) and [message](https://xapi-project.github.io/xen-api/classes/message.html) snapshots through the same pinned HTTPS sessions. History comes from `/rrd_updates` (XML or JSON) through `PinnedHttp`, which applies the same pin, hostname, redirect and size rules as XML-RPC. That URL carries a session reference, so errors never include it. Task results, backtraces and error arguments are excluded, and no task cancellation is offered. Alert refresh uses `event.from` on a separate foreground session, and dismissal is confirmed by reading the alert back.
+
+### Executable reference model
+
+`meteor_logic/` is a dependency-free Python reference model of the core safety rules: connection-generation fencing, capability gates, confirmation plans, a SQLite journal, duplicate-action exclusion and read-back verification. It predates the Android implementation and is useful for exploring edge cases; Android-specific reboot, encrypted-storage and manual-recovery behavior is covered by the Kotlin tests. The model covers both the direct-XAPI and planned Xen Orchestra provider shapes, but contains no network code.
+
+## Repository layout
+
+```
+android-app/                Gradle project (single :app module)
+  app/src/main/…/data/      Transport, XML-RPC, trust, vault, journal, power engine
+  app/src/main/…/           Compose UI and ViewModel
+  app/src/test/             JVM unit tests, a real loopback HTTPS/XAPI fixture, sanitized recordings of a real XCP-ng 8.3 host
+  app/src/androidTest/      Offline instrumentation tests (vault, journal, UI journeys, races)
+meteor_logic/               Python reference model and its tests
+scripts/                    Repository checks: source guard, version helper and release signing/verification
+design/                     Interactive HTML design studies
+docs/                       Architecture notes and the release guide
+```
+
+## Build and test in detail
+
+Requirements: **JDK 21**, the **Android SDK with platform 36.1**, and **Python 3.11+**. Point Gradle at the SDK with `ANDROID_HOME` or an untracked `android-app/local.properties` (`sdk.dir=…`).
+
+```sh
+cd android-app
+./gradlew :app:assembleDebug :app:testDebugUnitTest :app:lintDebug   # gradlew.bat on Windows
+```
+
+From the repository root:
+
+```sh
+python scripts/source_guard.py                         # blocks private-key headers, GitHub tokens, credential/keystore files and build artefacts
+python -m unittest discover -s scripts -p "test_*.py"  # safety and release-script tests (signing tests need the SDK build-tools and a JDK)
+python -m unittest meteor_logic.test_core              # reference-model tests
+```
+
+The JVM unit tests need no device or network. The transport tests start a local HTTPS server with a temporary self-signed certificate. CI ([`.github/workflows/validate.yml`](../.github/workflows/validate.yml)) runs all of the above on Ubuntu and needs no secrets.
+
+`./gradlew :app:assembleRelease` produces an **unsigned** APK, which Android will not install. Signed releases come from the [Release workflow](../.github/workflows/release.yml), which builds on GitHub's runners and signs outside Gradle with a pinned key; see [docs/RELEASING.md](RELEASING.md).
+
+Instrumentation tests in `app/src/androidTest` run offline with synthetic storage against a release-like build type (`candidate`, application ID `com.meteor.app.candidate`) that installs alongside a debug build. Some tests deliberately corrupt their own files, so run them on an emulator:
+
+```sh
+./gradlew -PmeteorTestBuildType=candidate :app:assembleCandidate :app:connectedCandidateAndroidTest
+```
+
+## Tech stack
+
+Kotlin · Jetpack Compose (Material 3) · Kotlin coroutines & Flow · AndroidX Lifecycle / ViewModel · DataStore · WorkManager · Android Keystore · `HttpsURLConnection` + XmlPullParser · JUnit 4 · Python 3.11+ (reference model and repository checks) · GitHub Actions
+
+Minimum Android 12 (API 31), target API 36.
