@@ -56,10 +56,12 @@ sealed interface Destination {
     data object Networks : Destination { override val key = "networks" }
     // --- B1 console ---
     /**
-     * The full-screen VM console (drawn as an immersive layer by `MeteorApp`). It names the VM only; the live
-     * session belongs to the view model's `ConsoleController`. Never restored after process death.
+     * The full-screen console of a VM, or with [host] of an XCP-ng host (drawn as an immersive layer by `MeteorApp`). It
+     * names the VM or host only ([vmUuid] and [vmName] are the host's for a host console); the live session belongs to the
+     * view model's `ConsoleController`. Never restored after process death.
      */
-    data class Console(val profileId: String, val authority: String, val vmUuid: String, val vmName: String) : Destination {
+    data class Console(val profileId: String, val authority: String, val vmUuid: String, val vmName: String,
+        val host: Boolean = false) : Destination {
         override val key = "console"
         override val restorable get() = false
     }

@@ -57,7 +57,8 @@ internal class DetailsController(
     fun load(profile: Profile, authority: String, uuid: String, action: PowerAction? = null, automatic: Boolean = false,
         target: HostChoice? = null) {
         val start = state.value
-        if (start.operationBusy || start.profileBusy) return
+        // Stop watching: plain reads run while a sent operation is only observed; a load that opens a confirmation still waits.
+        if (ControlGates.operationExclusive(start) || start.profileBusy || action != null && start.operationBusy) return
         val request = ++generation
         val connection = connectionGeneration()
         val previous = start.details

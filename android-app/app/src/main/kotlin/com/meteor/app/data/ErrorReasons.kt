@@ -95,6 +95,13 @@ object ErrorReasons {
         }
     }
 
+    /**
+     * A preference that could not be saved. A validation failure explains itself ("Choose an image under 3 MB.");
+     * anything else, including a bare `require` with no message, stays generic.
+     */
+    fun preference(error: Throwable): String = (error as? IllegalArgumentException)?.message
+        ?.takeIf { it.isNotBlank() && it != "Failed requirement." && it.length <= 120 } ?: "That preference could not be saved. Try again."
+
     /** For read-only features that keep last-known values. [feature] is e.g. "Pool activity". */
     fun readIssue(error: Throwable, feature: String): String = when {
         error is UnsupportedOperationException || error is RpcFailure && error.code in setOf("MESSAGE_METHOD_UNKNOWN", "NOT_IMPLEMENTED") -> "$feature is not supported by this server."

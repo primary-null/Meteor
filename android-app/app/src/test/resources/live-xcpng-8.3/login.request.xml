@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><methodCall><methodName>session.login_with_password</methodName><params><param><value><string>root</string></value></param><param><value><string>REDACTED</string></value></param><param><value><string>1.0</string></value></param><param><value><string>MeteorAndroidSpark</string></value></param></params></methodCall>

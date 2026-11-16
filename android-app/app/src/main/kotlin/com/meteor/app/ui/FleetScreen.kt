@@ -14,6 +14,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.selected
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
@@ -34,14 +35,14 @@ import com.meteor.app.data.*
     // On a wide screen Back first closes the detail pane, as it dismisses the dialog on a phone.
     BackHandler(enabled = panes && selected != null) { model.closeDetails() }
     ListDetailLayout(showDetail = true,
-        list = { VmList(state, model, listState, selected?.uuid?.takeIf { panes }, model::openDetails) },
+        list = { VmList(state, model, listState, selected?.uuid?.takeIf { panes }, model::openDetails, model::openConsole) },
         detail = {
             if (selected != null) VmDetailsPane(selected, state, model, { performance(selected) }, model::closeDetails)
             else EmptyPane("Select a virtual machine", "Its details, performance and available actions appear here.")
         })
 }
 
-@Composable private fun VmList(state: MeteorState, model: MeteorViewModel, listState: LazyListState, selectedUuid: String?, select: (Guest) -> Unit) {
+@Composable private fun VmList(state: MeteorState, model: MeteorViewModel, listState: LazyListState, selectedUuid: String?, select: (Guest) -> Unit, console: (Guest) -> Unit) {
     var search by rememberSaveable { mutableStateOf("") }
     var filter by rememberSaveable { mutableStateOf(FleetFilter.ALL) }
     val inventory = state.inventory
@@ -63,6 +64,8 @@ import com.meteor.app.data.*
                 Text(inventory.poolName, color = MaterialTheme.colorScheme.primary, fontWeight = FontWeight.SemiBold)
                 Text("${matches.guests.size} of ${inventory.guests.size} VMs · Search by VM or host name",
                     style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                // inventory scale: what could not be loaded is said, never hidden
+                inventory.notLoaded.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
             }
             val groups = InventoryMapper.groups(matches)
             groups.forEach { group ->
@@ -82,8 +85,13 @@ import com.meteor.app.data.*
                     if (guests.isEmpty()) item { Text("No resident VMs", style = MaterialTheme.typography.bodySmall) }
                     items(guests, key = { "vm:${it.uuid}" }) { guest ->
                         val isSelected = guest.uuid == selectedUuid
+                        // The console is the primary action for a running VM; the Details button is the secondary one. A VM in
+                        // any other state has no console, so its row opens the details.
+                        val primary = FleetRowAction.primary(guest, state.connected)
                         Surface(Modifier.fillMaxWidth().semantics { selected = isSelected }
-                            .clickable(onClickLabel = "Open details", role = Role.Button) { select(guest) },
+                            .clickable(onClickLabel = if (primary == FleetRowAction.CONSOLE) "Open console" else "Open details", role = Role.Button) {
+                                if (primary == FleetRowAction.CONSOLE) console(guest) else select(guest)
+                            },
                             shape = RoundedCornerShape(18.dp),
                             color = if (isSelected) MaterialTheme.colorScheme.secondaryContainer else MaterialTheme.colorScheme.surface) {
                             Row(Modifier.padding(16.dp), verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(14.dp)) {
@@ -96,6 +104,8 @@ import com.meteor.app.data.*
                                         color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1, overflow = TextOverflow.Ellipsis)
                                 }
                                 Text(guest.power, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary, maxLines = 1, softWrap = false)
+                                if (primary == FleetRowAction.CONSOLE)
+                                    TextButton(onClick = { select(guest) }, modifier = Modifier.semantics { contentDescription = "Details for ${guest.name}" }) { Text("Details") }
                             }
                         }
                     }

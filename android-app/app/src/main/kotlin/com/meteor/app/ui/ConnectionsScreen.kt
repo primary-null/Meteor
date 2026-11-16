@@ -17,24 +17,26 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
 import androidx.compose.ui.unit.dp
+import com.meteor.app.ControlGates
 import com.meteor.app.MeteorState
 import com.meteor.app.MeteorViewModel
 
 @Composable internal fun ConnectionsScreen(state: MeteorState, model: MeteorViewModel) {
     var forgetId by rememberSaveable { mutableStateOf<String?>(null) }
     var certificateId by rememberSaveable { mutableStateOf<String?>(null) }
-    val editable = !state.loading && !state.profileBusy && !state.operationBusy && state.pendingTrust == null
+    val editable = !state.loading && !state.profileBusy && !ControlGates.operationExclusive(state) && state.pendingTrust == null
     val editorKey = "editor:${state.editingProfileId ?: "new"}:${state.profileEditSession}"
     val listState = rememberLazyListState()
-    LaunchedEffect(state.editingProfileId) { if (state.editingProfileId != null) listState.animateScrollToItem(1) }
+    LaunchedEffect(state.editingProfileId) { if (state.editingProfileId != null) listState.animateScrollToItem(if (state.vaultProblem) 2 else 1) } // vault recovery: the panel, when shown, sits above the editor
     LazyColumn(Modifier.fillMaxSize().testTag("connections-list"), state = listState, contentPadding = PaddingValues(20.dp), verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item { PageTitle("Connections", "Direct XAPI · HTTPS · certificate pinning") }
+        if (state.vaultProblem) item(key = "vault-recovery") { VaultRecoveryPanel(state, model) } // vault recovery
         if (state.editingProfileId != null) item(key = editorKey) { ConnectionForm(state, model) }
         if (state.selectedProfile != null || state.loading) item {
             Panel {
                 Text(state.selectedProfile?.label ?: "Connecting", style = MaterialTheme.typography.titleMedium)
                 Text(if (state.connected) "Connected" else if (state.loading) "Connecting…" else "Last connection unavailable", style = MaterialTheme.typography.bodySmall)
-                OutlinedButton(onClick = model::disconnect, enabled = !state.profileBusy && !state.operationBusy) { Text("Disconnect") }
+                OutlinedButton(onClick = model::disconnect, enabled = !state.profileBusy && !ControlGates.operationExclusive(state)) { Text("Disconnect") }
                 Text("Disconnect stops refreshes and clears the active selection. Saved profiles and operation history are kept.", style = MaterialTheme.typography.bodySmall)
             }
         }
@@ -88,7 +90,7 @@ import com.meteor.app.MeteorViewModel
     // Password drafts never enter saved instance state, including during activity recreation.
     var password by remember(key) { mutableStateOf("") }
     LaunchedEffect(state.manualConnectionEvent) { if (state.manualConnectionEvent > 0) password = "" }
-    val enabled = !state.loading && !state.profileBusy && !state.operationBusy && state.pendingTrust == null
+    val enabled = !state.loading && !state.profileBusy && !ControlGates.operationExclusive(state) && state.pendingTrust == null
     val valid = enabled && endpoint.isNotBlank() && username.isNotBlank() && (editing != null || password.isNotBlank())
     Panel {
         Text(if (editing == null) "Add XCP-ng server" else "Edit connection", style = MaterialTheme.typography.titleLarge)
@@ -102,7 +104,8 @@ import com.meteor.app.MeteorViewModel
             Text("Leave the new password empty to keep the saved password. Changing credentials keeps the saved certificate pin; a different server requires certificate review.", style = MaterialTheme.typography.bodySmall)
             Button(onClick = { submit { model.saveConnection(label, endpoint, username, password, editing.id) } }, enabled = valid) { Text("Save changes") }
             OutlinedButton(onClick = { submit { model.inspect(label, endpoint, username, password, editing.id) } }, enabled = valid) { Text("Review server certificate") }
-            TextButton(onClick = { submit(model::cancelEdit) }, enabled = !state.profileBusy && !state.operationBusy) { Text("Cancel editing") }
+            TextButton(onClick = { submit(model::cancelEdit) }, enabled = !state.profileBusy && !ControlGates.operationExclusive(state)) { Text("Cancel editing") }
+            if (ControlGates.identityHeld(state, editing.id)) Text(ControlGates.IDENTITY_HELD_EDIT, style = MaterialTheme.typography.bodySmall) // stop watching
             if (state.operation?.let { it.unresolved && it.profileId == editing.id } == true)
                 Text("Pending actions retain their original connection identity. Changing the server, username or certificate requires manual review of the pending action.", style = MaterialTheme.typography.bodySmall)
         } else Button(onClick = { submit { model.inspect(label, endpoint, username, password) } }, enabled = valid) { Text("Review certificate") }

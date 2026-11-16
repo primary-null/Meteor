@@ -19,6 +19,8 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.meteor.app.MeteorViewModel
 import com.meteor.app.NotificationAccess
 import com.meteor.app.data.AlertNotifySettings
+import com.meteor.app.data.BackgroundCheckText
+import com.meteor.app.data.BackgroundChecks
 import com.meteor.app.data.NotifyThreshold
 
 // --- B3 background/summary ---
@@ -30,6 +32,7 @@ import com.meteor.app.data.NotifyThreshold
 @Composable
 internal fun BackgroundAlertsSettings(model: MeteorViewModel) {
     val state by model.state.collectAsStateWithLifecycle()
+    val checks by model.backgroundChecks.collectAsStateWithLifecycle(BackgroundChecks())
     val context = LocalContext.current
     var allowed by remember { mutableStateOf(NotificationAccess.allowed(context)) }
     var blockedChannels by remember { mutableStateOf(NotificationAccess.blockedChannels(context)) }
@@ -50,10 +53,10 @@ internal fun BackgroundAlertsSettings(model: MeteorViewModel) {
     }
     Panel {
         Text("Background alerts", style = MaterialTheme.typography.titleMedium)
-        Text("Off by default. When on, Android checks that connection about every chosen interval while the network is up and the battery is not low: " +
+        Text("Off by default. When on, Android checks that connection about every chosen interval while the network is up: " +
             "one short read-only sign-in, new alerts only, then sign-out. Nothing is changed on the server. Notifications show the pool, the object and the alert name.",
             style = MaterialTheme.typography.bodySmall)
-        if (state.vaultProblem) Text("Saved profiles could not be opened, so background checks are unavailable.", style = MaterialTheme.typography.bodySmall,
+        if (state.vaultProblem) Text("Saved connections could not be opened, so background checks are unavailable. Open Connections to fix this.", style = MaterialTheme.typography.bodySmall,
             color = MaterialTheme.colorScheme.error)
         val anyEnabled = state.alertNotify.values.any { it.enabled }
         if ((denied || anyEnabled) && !allowed || blockedChannels.isNotEmpty() && anyEnabled) {
@@ -61,6 +64,10 @@ internal fun BackgroundAlertsSettings(model: MeteorViewModel) {
                 else "Turned off in Android settings: ${blockedChannels.joinToString(", ")}. Those alerts will not appear.",
                 style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             OutlinedButton(onClick = { runCatching { context.startActivity(NotificationAccess.settingsIntent(context)) } }) { Text("Open notification settings") }
+        }
+        val now = System.currentTimeMillis()
+        if (anyEnabled) BackgroundCheckText.runLine(checks.runNote, now)?.let {
+            Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
         }
         if (state.profiles.isEmpty()) Text("Save a connection first.", style = MaterialTheme.typography.bodySmall)
         state.profiles.forEach { profile ->
@@ -93,9 +100,16 @@ internal fun BackgroundAlertsSettings(model: MeteorViewModel) {
                             label = { Text("$minutes min") })
                     }
                 }
+                // What the last check came to, in plain words. A failure is shown in the error colour.
+                val status = checks.statuses[profile.id]
+                BackgroundCheckText.lines(status, allowed, now).forEachIndexed { index, line ->
+                    val problem = line == BackgroundCheckText.NOT_ALLOWED || status?.outcome?.success == false
+                    Text(line, modifier = Modifier.testTag("check-status-${profile.id}-$index"), style = MaterialTheme.typography.bodySmall,
+                        color = if (problem) MaterialTheme.colorScheme.error else MaterialTheme.colorScheme.onSurfaceVariant)
+                }
             }
         }
-        Text("Android may delay checks to save battery. Unread markers inside Meteor are separate from notifications.",
+        Text("Android may delay checks to save battery. A check that fails because the network is down is tried again a few minutes later. Opening Alerts in Meteor clears that connection's alert notifications, and alerts you have already seen there are not notified.",
             style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
     }
 }

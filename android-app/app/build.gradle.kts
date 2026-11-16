@@ -32,7 +32,8 @@ android {
         create("candidate") {
             initWith(getByName("release"))
             applicationIdSuffix = ".candidate"
-            versionNameSuffix = "-rc2"
+            // Derived, so it cannot go stale: 1.10 with versionCode 17 is 1.10-rc17.
+            versionNameSuffix = "-rc" + meteorVersion.getProperty("versionCode")
             signingConfig = signingConfigs.getByName("debug")
             isDebuggable = false
             matchingFallbacks += listOf("release")

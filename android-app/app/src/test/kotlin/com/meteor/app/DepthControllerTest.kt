@@ -342,4 +342,16 @@ class DepthControllerTest {
         controller.depth.loadVm("vm-1"); runCurrent(); assertNotNull(state.value.depth.vm.value)
         controller.invalidate(); assertEquals(DepthState(), state.value.depth); assertNull(state.value.metricTarget)
     }
+
+    // --- stop watching ---
+    @Test fun aWatchedOperationDoesNotHoldChartsOrDetailReads() = runTest {
+        val state = state(); val backend = Backend(this@DepthControllerTest)
+        state.value = state.value.copy(operationBusy = true, operationWatching = true)
+        val controller = DepthController(backgroundScope, backend, state)
+        controller.loadHost("host-1"); controller.loadNetworks(); runCurrent()
+        assertEquals(2, backend.reads)
+        controller.selectRange(HistoryRange.TEN_MINUTES); runCurrent()
+        assertEquals(3, backend.reads)
+    }
+    // --- end stop watching ---
 }

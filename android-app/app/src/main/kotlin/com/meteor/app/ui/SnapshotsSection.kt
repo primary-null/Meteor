@@ -9,6 +9,10 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.saveable.rememberSaveable
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
@@ -33,7 +37,10 @@ import com.meteor.app.data.*
         TargetActionButton(TargetAction.SNAPSHOT_TAKE, "Take snapshot…", TargetRules.unavailableReason(vm, TargetAction.SNAPSHOT_TAKE),
             ready, state) { controller.request(TargetAction.SNAPSHOT_TAKE, vm.authority, TargetKind.VM, vm.uuid) }
         if (vm.snapshots.isEmpty()) Text("No snapshots", style = MaterialTheme.typography.bodySmall)
-        vm.snapshots.forEach { snapshot ->
+        // inventory scale: every snapshot is read; long lists show the newest first and expand on request
+        var showAll by rememberSaveable(vm.uuid) { mutableStateOf(false) }
+        val shown = if (showAll) vm.snapshots else vm.snapshots.take(SNAPSHOTS_SHOWN)
+        shown.forEach { snapshot ->
             Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 val current = if (vm.parentUuid == snapshot.uuid) " · current base" else ""
                 Text("${snapshot.name.ifBlank { "Unnamed snapshot" }}\n${XapiTime.display(snapshot.time, missing = "Time not reported")}" +
@@ -46,7 +53,11 @@ import com.meteor.app.data.*
                 }
             }
         }
-        if (vm.snapshotsTruncated) Text("Only the first ${vm.snapshots.size} snapshots are listed.", style = MaterialTheme.typography.bodySmall)
+        if (shown.size < vm.snapshots.size) TextButton(onClick = { showAll = true }) {
+            Text("Showing the newest ${shown.size} of ${vm.snapshots.size} snapshots. Show all")
+        }
+        if (vm.snapshotsTruncated) Text("This VM has more snapshots than Meteor reads at once; only ${vm.snapshots.size} are listed, and a new snapshot cannot be verified.",
+            style = MaterialTheme.typography.bodySmall)
         TargetRules.roleExplanation(state.selectedPermissions, TargetAction.SNAPSHOT_REVERT)?.let {
             Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
         }
@@ -56,3 +67,6 @@ import com.meteor.app.data.*
     Text("Revert and delete need the exact name. Delete removes only the snapshot's own disk snapshots, never the VM's current disks.",
         style = MaterialTheme.typography.bodySmall)
 }
+
+// inventory scale
+private const val SNAPSHOTS_SHOWN = 100

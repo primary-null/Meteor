@@ -152,6 +152,19 @@ class EventControllerTest {
         assertEquals(listOf("inventory", "details", "alerts-full", "activity"), f.actions.take())
         assertEquals(EventStatus.LIVE, state.value.events)
     }
+    @Test fun aTokenTheServerCannotParseTakesAFreshTokenLikeLostEventsAndDoesNotBackOff() = runTest {
+        val state = MutableStateFlow(ready()); val f = fixture(state); val s = session(f)
+        f.controller.start(); runCurrent(); advanceTimeBy(1000); runCurrent(); f.actions.take()
+        s.batch("tok-1"); runCurrent()
+        s.onBegin = { "fresh-token" }
+        s.fail(RpcFailure("EVENT_FROM_TOKEN_PARSE_FAILURE", details = listOf("tok-1"))); runCurrent()
+        assertEquals(2, s.begins); assertEquals(1, f.backend.opened.size); assertEquals(0, s.closes)   // same session, no reconnect, no delay
+        assertEquals(EventStatus.LIVE, state.value.events)
+        s.batch("tok-after"); runCurrent()
+        assertEquals(listOf("t1.1", "tok-1", "fresh-token", "tok-after"), s.tokensSeen)
+        advanceTimeBy(10_000); runCurrent()
+        assertEquals(listOf("inventory", "details", "alerts-full", "activity"), f.actions.take())
+    }
     @Test fun anOversizedAnswerIsTreatedLikeLostEvents() = runTest {
         val state = MutableStateFlow(ready()); val f = fixture(state); val s = session(f)
         f.controller.start(); runCurrent(); advanceTimeBy(1000); runCurrent(); f.actions.take()
@@ -261,4 +274,17 @@ class EventControllerTest {
         f.controller.stop(); runCurrent()
         assertEquals(1, s.closes)
     }
+    // --- offline and reconnect ---
+    @Test fun noSessionIsOpenedWhileOfflineOrWhileAutomaticReconnectingIsStopped() = runTest {
+        val state = MutableStateFlow(ready().copy(offline = true)); val f = fixture(state); val s = session(f)
+        f.controller.start(); runCurrent()
+        assertTrue("no events login without a network", f.backend.opened.isEmpty()); assertEquals(EventStatus.OFF, state.value.events)
+        state.value = state.value.copy(offline = false, retryStop = RetryStop.AUTHENTICATION); runCurrent()
+        assertTrue("no second session sends the rejected password again", f.backend.opened.isEmpty())
+        state.value = state.value.copy(retryStop = null); runCurrent()
+        assertEquals(1, f.backend.opened.size); assertEquals(1, s.begins)
+        state.value = state.value.copy(offline = true); runCurrent()
+        assertEquals("going offline closes the session cleanly", 1, s.closes); assertEquals(EventStatus.OFF, state.value.events)
+    }
+    // --- end offline and reconnect ---
 }

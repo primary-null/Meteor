@@ -81,6 +81,11 @@ internal fun HistoryChartCard(title: String, series: List<HistorySeries>, timest
                 Text(format.format(Date(timestamps.first() * 1000)), style = MaterialTheme.typography.labelSmall)
                 Text(format.format(Date(timestamps.last() * 1000)), style = MaterialTheme.typography.labelSmall)
             }
+            // The axis always spans the window; say so when the server recorded nothing for its first part.
+            HistoryChartMath.dataStartsLate(timestamps, series.map { it.values }, stepSeconds)?.let { start ->
+                Text("The server recorded nothing before ${format.format(Date(start * 1000))}, so the line starts there.",
+                    style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
         }
         series.forEachIndexed { slot, line ->
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {

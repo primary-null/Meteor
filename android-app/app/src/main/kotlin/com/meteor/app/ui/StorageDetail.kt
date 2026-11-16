@@ -58,6 +58,7 @@ fun StorageDetail(srUuid: String) {
                 append("\n").append(vdi.virtualSize?.let { "${HistoryFormat.size(it)} virtual" } ?: "size unknown")
                 append(" · ").append(vdi.physicalUtilisation?.let { "${HistoryFormat.size(it)} used" } ?: "usage unknown")
                 append("\n").append(if (vdi.attachedVms.isEmpty()) "Not attached to a VM" else "Used by ${vdi.attachedVms.joinToString(", ")}")
+                if (vdi.attachedTotal > vdi.attachedVms.size) append(" and ${vdi.attachedTotal - vdi.attachedVms.size} more") // inventory scale
             }, style = MaterialTheme.typography.bodySmall)
         }
         if (info.totalVdis > info.vdis.size) Text("Showing ${info.vdis.size} of ${info.totalVdis} disks, largest first within that sample.", style = MaterialTheme.typography.labelSmall)

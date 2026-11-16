@@ -23,7 +23,7 @@ internal class ObservabilityController(
         state.update { it.copy(metricTarget = null, metricSamples = emptyList(), metricsBusy = false, metricsProblem = null,
             poolActivity = null, activityBusy = false, activityProblem = null) }
     }
-    private fun ready() = state.value.let { it.connected && !it.loading && !it.profileBusy && !it.operationBusy && it.pendingTrust == null }
+    private fun ready() = state.value.let { it.connected && !it.loading && !it.profileBusy && !ControlGates.operationExclusive(it) && it.pendingTrust == null } // stop watching: reads run while an operation is observed
     private fun matches(profile: Profile, authority: String) = state.value.let {
         it.connected && it.selectedProfile == profile && it.inventory?.authority == authority && it.pendingTrust == null
     }

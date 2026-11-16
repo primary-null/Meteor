@@ -133,4 +133,59 @@ class ConnectionControllerTest {
         assertEquals(0, f.vault.writes)
         assertEquals(NoticeKind.ERROR, f.state.value.notice?.kind)
     }
+
+    // --- stop watching ---
+    private fun watched(profile: Profile = original) = PowerOperation("op", profile.id, profile.origin(), "pool", "vm", "Guest",
+        PowerAction.SHUTDOWN, null, PowerPhase.TRACKING, 1, 1, "task-ref", "task-uuid")
+
+    @Test fun aWatchedOperationLeavesRefreshSwitchAndDisconnectAvailable() = runTest {
+        val f = Fixture(backgroundScope)
+        f.state.value = f.state.value.copy(operationBusy = true, operationWatching = true, operation = watched())
+        f.controller.switchProfile(original); runCurrent()
+        assertTrue(f.state.value.connected); assertEquals(1, f.backend.reads)
+        f.controller.refresh(); runCurrent()
+        assertEquals(2, f.backend.reads); assertTrue(f.state.value.connected)
+        f.controller.refresh(automatic = true) // the poll and live events are not held either (backoff permitting)
+        f.controller.disconnect(); runCurrent()
+        assertNull(f.state.value.selectedId); assertFalse(f.state.value.connected)
+        // The operation record itself is untouched by any of it.
+        assertEquals(watched(), f.state.value.operation); assertTrue(f.state.value.operationBusy)
+    }
+
+    @Test fun aSendOrReviewInProgressStillHoldsConnections() = runTest {
+        val f = Fixture(backgroundScope)
+        f.state.value = f.state.value.copy(selectedId = original.id, operationBusy = true, operationWatching = false, operation = watched())
+        f.controller.switchProfile(original); f.controller.refresh(); f.controller.disconnect()
+        f.controller.inspect("New", "https://new.invalid/", "tester", "pw")
+        runCurrent()
+        assertEquals(0, f.backend.reads); assertEquals(0, f.inspections); assertEquals(original.id, f.state.value.selectedId)
+    }
+
+    @Test fun theWatchedOperationsOwnConnectionKeepsItsIdentity() = runTest {
+        val f = Fixture(backgroundScope)
+        f.state.value = f.state.value.copy(operationBusy = true, operationWatching = true, operation = watched())
+        f.controller.saveConnection("Fixture", original.endpoint, "someone-else", "", original.id); runCurrent()
+        assertEquals(ControlGates.IDENTITY_HELD, f.state.value.message)
+        assertEquals(original, f.vault.document.profiles.single()); assertEquals(0, f.backend.reads)
+        f.controller.inspect("Fixture", "https://other.invalid/", original.username, "", original.id); runCurrent()
+        assertEquals(0, f.inspections)
+        f.state.value = f.state.value.copy(pendingTrust = PendingTrust(original.copy(certificateSha256 = "c".repeat(64)), ServerCertificate("c".repeat(64), "Fixture", 1, 2), original))
+        f.controller.acceptTrust(); runCurrent()
+        assertNotNull(f.state.value.pendingTrust); assertEquals(0, f.backend.reads)
+        f.state.value = f.state.value.copy(pendingTrust = null, notice = null)
+        // A rename keeps the identity, and a new connection is a different identity: both are allowed.
+        f.controller.saveConnection("Renamed", original.endpoint, original.username, "", original.id); runCurrent()
+        assertEquals("Renamed", f.vault.document.profiles.single().label)
+        f.controller.inspect("New", "https://new.invalid/", "tester", "pw"); runCurrent()
+        assertEquals(1, f.inspections)
+    }
+
+    @Test fun anotherConnectionsOperationDoesNotHoldThisOne() = runTest {
+        val f = Fixture(backgroundScope)
+        val other = original.copy(id = "other", endpoint = "https://other.invalid/")
+        f.state.value = f.state.value.copy(operationBusy = true, operationWatching = true, operation = watched(other))
+        f.controller.inspect("Fixture", "https://moved.invalid/", original.username, "", original.id); runCurrent()
+        assertEquals(1, f.inspections); assertNull(f.state.value.message)
+    }
+    // --- end stop watching ---
 }

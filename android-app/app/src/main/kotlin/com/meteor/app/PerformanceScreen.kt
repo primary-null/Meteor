@@ -17,25 +17,7 @@ import java.text.DateFormat
 import java.util.Date
 import java.util.Locale
 
-internal fun metricText(value: Double?, unit: String): String {
-    if (value == null || !value.isFinite()) return "Unavailable"
-    fun number(number: Double) = String.format(Locale.getDefault(), "%.3g", number)
-    fun memory(bytes: Double): String = when {
-        !bytes.isFinite() -> number(value) + " " + unit
-        bytes >= 1L.shl(30) -> number(bytes / 1L.shl(30)) + " GiB"
-        bytes >= 1L.shl(20) -> number(bytes / 1L.shl(20)) + " MiB"
-        bytes >= 1024 -> number(bytes / 1024) + " KiB"
-        else -> number(bytes) + " B"
-    }
-    return when (unit.lowercase(Locale.ROOT)) {
-        "fraction", "ratio" -> if ((value * 100).isFinite()) number(value * 100) + "%" else "Unavailable"
-        "%", "percent" -> number(value) + "%"
-        "b", "bytes" -> memory(value)
-        "kib", "kibibytes" -> memory(value * 1024)
-        "b/s", "bytes/s", "bytes per second" -> memory(value) + "/s"
-        else -> (number(value) + " " + unit).trim()
-    }
-}
+internal fun metricText(value: Double?, unit: String): String = MetricFormat.text(value, unit)
 
 @Composable
 internal fun PerformanceScreen(state: MeteorState, now: Long, refresh: () -> Unit, back: () -> Unit) {
@@ -49,7 +31,7 @@ internal fun PerformanceScreen(state: MeteorState, now: Long, refresh: () -> Uni
                 style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = back) { Text("Back") }
-                OutlinedButton(onClick = refresh, enabled = target != null && state.connected && !state.metricsBusy && !state.loading && !state.operationBusy) { Text("Refresh metrics") }
+                OutlinedButton(onClick = refresh, enabled = target != null && state.connected && !state.metricsBusy && !state.loading && !ControlGates.operationExclusive(state)) { Text("Refresh metrics") }
             }
         }
         if (state.metricsBusy && latest == null) item { LinearProgressIndicator(Modifier.fillMaxWidth()) }
@@ -60,7 +42,7 @@ internal fun PerformanceScreen(state: MeteorState, now: Long, refresh: () -> Uni
                 Text("${if (fresh) "Latest sample" else "Last-known sample"} · ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(latest.observedAt))}",
                     style = MaterialTheme.typography.labelMedium)
                 latest.note?.let { Text(it) }
-                if (latest.readings.isNotEmpty()) Text("Showing ${latest.readings.size} of ${latest.advertisedCount} advertised sources.", style = MaterialTheme.typography.bodySmall)
+                if (latest.readings.isNotEmpty()) Text("Showing ${latest.readings.size} of ${latest.advertisedCount} sources the server lists.", style = MaterialTheme.typography.bodySmall)
             }
             items(latest.readings, key = { it.name }) { reading ->
                 MetricCard(reading, state.metricSamples)
@@ -72,6 +54,7 @@ internal fun PerformanceScreen(state: MeteorState, now: Long, refresh: () -> Uni
 @Composable
 private fun MetricCard(reading: MetricReading, snapshots: List<MetricSnapshot>) {
     val ink = MaterialTheme.colorScheme.primary
+    val floor = MaterialTheme.colorScheme.outlineVariant
     val points = snapshots.map { snapshot ->
         snapshot.observedAt to snapshot.readings.firstOrNull { it.name == reading.name && it.unit == reading.unit }?.value
     }
@@ -82,16 +65,18 @@ private fun MetricCard(reading: MetricReading, snapshots: List<MetricSnapshot>) 
             Text(metricText(reading.value, reading.unit), style = MaterialTheme.typography.titleLarge)
             reading.unavailable?.let { Text(it, style = MaterialTheme.typography.bodySmall) }
             val values = points.mapNotNull { it.second?.takeIf { value -> value.isFinite() } }
+            if (reading.unit.equals("fraction", true) && (values.maxOrNull() ?: 0.0) <= 1.0) Text("Scale 0 to 100%", style = MaterialTheme.typography.labelSmall)
             if (values.isNotEmpty()) Text("Chart range: ${metricText(values.min(), reading.unit)} – ${metricText(values.max(), reading.unit)}",
                 style = MaterialTheme.typography.bodySmall)
             Canvas(Modifier.fillMaxWidth().height(60.dp).semantics { contentDescription = "Recent reported samples for ${reading.label}; missing values are gaps" }) {
                 if (values.isNotEmpty()) {
-                    val low = values.min(); val high = values.max()
-                    val range = (high - low).takeIf { it > 0 && it.isFinite() } ?: 1.0
+                    // The scale always starts at zero (percentages: 0 to 100%), so a move from 1% to 2% is not drawn as a spike.
+                    val top = LiveMetrics.scaleTop(reading.limit, values)
                     val start = points.first().first
                     val duration = (points.last().first - start).coerceAtLeast(1).toDouble()
+                    drawLine(floor, Offset(0f, size.height - 4), Offset(size.width, size.height - 4), strokeWidth = 1.dp.toPx())
                     fun position(point: Pair<Long, Double?>): Offset {
-                        val level = if (high > low) (point.second!! - low) / range else 0.5
+                        val level = (point.second!! / top).coerceIn(0.0, 1.0)
                         return Offset(((point.first - start) / duration * size.width).toFloat(),
                             (size.height - 4 - level * (size.height - 8)).toFloat())
                     }

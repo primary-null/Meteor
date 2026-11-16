@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><methodCall><methodName>system.methodSignature</methodName><params><param><value><string>host.reboot</string></value></param></params></methodCall>

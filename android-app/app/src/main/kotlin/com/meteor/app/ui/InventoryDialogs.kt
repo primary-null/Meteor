@@ -49,6 +49,7 @@ private fun ColumnScope.HostDetailsContent(host: Host, inventory: Inventory, con
 /** Extension point (A3): extra host detail sections, rendered after resident VMs. Content scrolls with its parent. */
 @Composable
 internal fun ColumnScope.HostDetailSectionsSlot(host: Host, inventory: Inventory, connected: Boolean) {
+    HostConsoleSection(host, inventory) // B1 console: the host's own console, view-only until input is confirmed
     HostDetailSections(host.uuid) // A3 observability: CPU, software, NICs, clock
     // --- B2 storage/host --- maintenance, reboot and shutdown (ui/HostOperationsSection.kt).
     HostOperationsSection(host, inventory)

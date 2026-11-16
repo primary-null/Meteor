@@ -75,6 +75,8 @@ class XapiStorageHostIntegrationTest {
     private val rpcErrors = mutableMapOf<String, String>()
     private var blockers = mapOf<String, List<String>>()
     @Volatile private var dropAsyncResponse = false
+    /** Journaled operation hardening: this read method answers HTTP 500 while the journal holds a SUBMITTING record. */
+    @Volatile private var failWhileSubmitting: String? = null
     private var counter = 0
     private val destroyed = mutableListOf<String>()
 
@@ -190,6 +192,7 @@ class XapiStorageHostIntegrationTest {
             method == "session.login_with_password" -> "OpaqueRef:fixture-session"
             method == "session.logout" -> ""
             method.endsWith(".get_all_records") -> table(type)
+            method.endsWith(".get_all_records_where") -> XapiWhere.filter(table(type), XapiWhere.unescape(args[1])) // inventory scale
             method.endsWith(".get_by_uuid") && type != "task" -> table(type).entries.firstOrNull { it.value["uuid"] == args[1] }?.key ?: throw Rejected("UUID_INVALID")
             method.endsWith(".get_record") && type != "task" -> table(type)[args[1]] ?: throw Rejected("HANDLE_INVALID")
             method == "host.get_vms_which_prevent_evacuation" -> blockers
@@ -231,7 +234,8 @@ class XapiStorageHostIntegrationTest {
                         response(mapOf("Status" to "Failure", "ErrorDescription" to listOf(rejected.code, method)))
                     }
                 }
-                if (dropAsyncResponse && method.startsWith("Async.")) exchange.sendResponseHeaders(500, -1)
+                if (method == failWhileSubmitting && store.records.values.any { it.phase == PowerPhase.SUBMITTING }) exchange.sendResponseHeaders(500, -1)
+                else if (dropAsyncResponse && method.startsWith("Async.")) exchange.sendResponseHeaders(500, -1)
                 else {
                     val bytes = xml.toByteArray(Charsets.UTF_8)
                     exchange.responseHeaders.add("Content-Type", "text/xml; charset=utf-8")
@@ -433,4 +437,83 @@ class XapiStorageHostIntegrationTest {
         assertEquals(listOf("Async.PBD.plug"), asyncCalls())
         assertEquals("session.logout", calls.last())
     }
+
+    // --- journaled operation hardening ---
+    @Test fun aFailedSendTimeReadIsNotSentAndReleasesTheFence() = runBlocking {
+        failWhileSubmitting = "PBD.get_by_uuid"
+        val result = run(TargetAction.PBD_PLUG, read(TargetKind.PBD, "pbd-b"))
+        assertEquals(result.message, PowerPhase.FAILED, result.phase); assertFalse(result.unresolved)
+        assertEquals("Not sent: Could not read the storage connection again just before sending (http-error).", result.message)
+        assertTrue(asyncCalls().isEmpty())
+        failWhileSubmitting = null
+        assertEquals(PowerPhase.SUCCEEDED, run(TargetAction.PBD_PLUG, read(TargetKind.PBD, "pbd-b")).phase)
+        assertEquals(listOf("Async.PBD.plug"), asyncCalls())
+    }
+
+    // --- inventory scale --- bounded lists that used to be cut silently
+
+    /** [count] existing snapshots of the fixture VM; every [sameNameEvery]th one is already called "Before upgrade". */
+    private fun seedSnapshots(count: Int, sameNameEvery: Int = 0) = synchronized(lock) {
+        val live = table("VM").getValue("vm-ref")
+        repeat(count) { i ->
+            val name = if (sameNameEvery > 0 && i % sameNameEvery == 0) "Before upgrade" else "Nightly $i"
+            table("VM")["old-$i-ref"] = vm("old-$i-ref", "old-$i", name, "Halted", NULL).apply {
+                put("is_a_snapshot", true); put("snapshot_of", "vm-ref"); put("snapshot_time", "2025%02d%02dT00:00:00Z".format(1 + i / 28 % 12, 1 + i % 28))
+                put("allowed_operations", listOf("revert", "destroy"))
+            }
+            live.list("snapshots") += "old-$i-ref"
+        }
+    }
+
+    @Test fun snapshotTakeIsProvenOnAVmWithMoreThanAHundredSnapshots() = runBlocking {
+        seedSnapshots(150, sameNameEvery = 40)
+        val vm = read(TargetKind.VM, "vm-id") as VmTarget
+        // Every snapshot is read in one filtered call (the old read stopped after the first 100 references).
+        assertEquals(150, vm.snapshots.size); assertFalse(vm.snapshotsTruncated)
+        assertEquals(1, calls.count { it == "VM.get_all_records_where" })
+        val taken = run(TargetAction.SNAPSHOT_TAKE, vm, name = "Before upgrade")
+        assertEquals(taken.message, PowerPhase.SUCCEEDED, taken.phase)
+        // The new snapshot is the 151st reference; it is found and proven, and the four older ones with the same name are not it.
+        val created = table("VM").entries.single { it.key.startsWith("snap-") }.value["uuid"]
+        assertEquals(created, taken.argumentUuid)
+        assertEquals(listOf("old-0", "old-120", "old-40", "old-80"), store.records.values.single().marker?.get("snapshots")?.split(","))
+        assertEquals(151, (read(TargetKind.VM, "vm-id") as VmTarget).snapshots.size)
+    }
+
+    @Test fun aVmWithMoreSnapshotsThanOneReadKeepsCannotTakeAnUnprovableSnapshot() = runBlocking {
+        seedSnapshots(150)
+        gateway.streamLimits = StreamLimits.DEFAULT.copy(maxRecords = 120)
+        val vm = read(TargetKind.VM, "vm-id") as VmTarget
+        assertTrue(vm.snapshotsTruncated); assertEquals(120, vm.snapshots.size)
+        assertTrue(TargetRules.unavailableReason(vm, TargetAction.SNAPSHOT_TAKE)!!.contains("could not be verified"))
+        val refused = runCatching { run(TargetAction.SNAPSHOT_TAKE, vm, name = "Never") }
+        assertTrue(refused.isFailure); assertTrue(asyncCalls().isEmpty())
+    }
+
+    @Test fun everyEvacuationBlockerIsReadAndNamedInOneBatch() = runBlocking {
+        synchronized(lock) {
+            repeat(60) { i -> table("VM")["b-$i-ref"] = vm("b-$i-ref", "b-$i", "Blocked %02d".format(i), "Running", "host-a-ref") }
+            table("host").getValue("host-a-ref").list("resident_VMs") += List(60) { "b-$it-ref" }
+            blockers = List(60) { "b-$it-ref" }.associateWith { listOf("VM_REQUIRES_SR", it) }
+        }
+        val host = read(TargetKind.HOST, "host-a") as HostState
+        assertEquals(60, host.blockers!!.size); assertEquals("Blocked 00", host.blockers!!.first().vmName)
+        assertEquals(61, host.residentVms.size)
+        assertTrue(TargetRules.unavailableReason(host.copy(enabled = false), TargetAction.HOST_EVACUATE)!!.startsWith("60 VMs prevent"))
+        assertEquals(0, calls.count { it == "VM.get_record" })
+    }
+
+    @Test fun everyStorageConnectionAndTheTrueIsoCountAreReturned() = runBlocking {
+        synchronized(lock) {
+            repeat(250) { i -> table("PBD")["extra-$i-ref"] = mutableMapOf("uuid" to "extra-$i", "SR" to "sr-nfs-ref", "host" to "host-b-ref", "currently_attached" to true) }
+            repeat(230) { i -> table("VDI")["isox-$i-ref"] = vdi("isox-$i", "image-%03d.iso".format(i), "sr-iso-ref", false) }
+            repeat(40) { i -> table("VDI")["disk-$i-ref"] = vdi("disk-$i", "disk $i", "sr-local-ref", false) }
+        }
+        assertEquals(252, gateway.poolPbds(profile, "pool-id").size)
+        val catalog = gateway.isoCatalog(profile, "pool-id")
+        assertEquals(200, catalog.isos.size); assertEquals(232, catalog.total); assertTrue(catalog.truncated)
+        // Only the ISO repository's VDIs are read, never every disk of the pool.
+        assertTrue("VDI.get_all_records" !in calls); assertTrue("VDI.get_all_records_where" in calls)
+    }
+    // --- end inventory scale ---
 }

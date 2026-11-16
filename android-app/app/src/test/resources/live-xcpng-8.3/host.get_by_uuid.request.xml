@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><methodCall><methodName>host.get_by_uuid</methodName><params><param><value><string>OpaqueRef:5ea09624-b8ca-47e2-8ded-e2471f32ccff</string></value></param><param><value><string>d026ea06-be9d-44a8-83ff-4212e579adc2</string></value></param></params></methodCall>

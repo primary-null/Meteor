@@ -19,6 +19,8 @@ class BackgroundTransportIntegrationTest {
     private val bodies = CopyOnWriteArrayList<String>()
     private var rpcErrors = emptyMap<String, Pair<String, List<String>>>()
     private var pluginAnswer: Any = "[{\"name\":\"xen-hypervisor\",\"version\":\"4.17.5\",\"release\":\"15\"},{\"name\":\"kernel\",\"version\":\"4.19\"}]"
+    /** What the pool master reports for `host.get_servertime`; null makes the call fail the way a refused read would. */
+    private var serverTime: String? = "20271115T10:30:00Z"
     private var messages: Map<String, Map<String, Any>> = mapOf(
         "OpaqueRef:m1" to mapOf("uuid" to "m1", "name" to "ha_host_failed", "priority" to "1", "cls" to "Host", "obj_uuid" to "host-id",
             "timestamp" to "20271115T10:00:00Z", "body" to "Host 203.0.113.5 failed"),
@@ -63,7 +65,8 @@ class BackgroundTransportIntegrationTest {
     private fun result(method: String, body: String): Any? = when (method) {
         "session.login_with_password" -> "OpaqueRef:session"
         "session.logout" -> ""
-        "pool.get_all_records" -> mapOf("OpaqueRef:pool" to mapOf("uuid" to "pool-id", "name_label" to "Fixture pool"))
+        "pool.get_all_records" -> mapOf("OpaqueRef:pool" to mapOf("uuid" to "pool-id", "name_label" to "Fixture pool", "master" to "OpaqueRef:h1"))
+        "host.get_servertime" -> serverTime
         "host.get_all_records" -> mapOf("OpaqueRef:h1" to mapOf("uuid" to "host-id", "metrics" to "OpaqueRef:hm1"),
             "OpaqueRef:h2" to mapOf("uuid" to "host-2", "metrics" to "OpaqueRef:hm2"))
         "host_metrics.get_all_records" -> mapOf("OpaqueRef:hm1" to mapOf("live" to true), "OpaqueRef:hm2" to mapOf("live" to false))
@@ -88,9 +91,10 @@ class BackgroundTransportIntegrationTest {
     // ---- background alert read ----
     @Test fun backgroundReadIsOneSessionWithGetSinceAndBoundedNameReads() = runBlocking {
         val since = 1_800_000_000_000L
-        val fetch = XapiGateway { since }.backgroundAlerts(profile, since) { it.severity.urgent }
-        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "pool.get_all_records", "message.get_since", "pool.get_all_records",
-            "SR.get_by_uuid", "host.get_by_uuid", "host.get_name_label", "session.logout"), calls.toList())
+        val fetch = XapiGateway { since }.backgroundAlerts(profile, { _, _ -> since }) { it.severity.urgent }
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "host.get_servertime", "pool.get_all_records", "message.get_since",
+            "pool.get_all_records", "SR.get_by_uuid", "host.get_by_uuid", "host.get_name_label", "session.logout"), calls.toList())
+        assertEquals("OpaqueRef:h1", args(bodies[calls.indexOf("host.get_servertime")]).last()) // the pool master, read-only
         assertEquals(1, calls.count { it == "session.login_with_password" })
         assertTrue(bodies[calls.indexOf("message.get_since")].contains("<dateTime.iso8601>20270115T08:00:00Z</dateTime.iso8601>"))
         assertEquals("pool-id", fetch.authority); assertEquals("Fixture pool", fetch.poolName)
@@ -100,9 +104,10 @@ class BackgroundTransportIntegrationTest {
     }
 
     @Test fun backgroundReadEndToEndProducesNotificationTextWithoutBodiesOrAddresses() = runBlocking {
-        val settings = AlertNotifySettings(true, NotifyThreshold.HIGH, 15, 1_800_000_000_000L)
-        val fetch = XapiGateway().backgroundAlerts(profile, BackgroundAlerts.since(profile, settings, null, 0), BackgroundAlerts.wanted(settings))
-        val decision = BackgroundAlerts.decide(profile, settings, null, fetch, 0)
+        // The switch was turned on at 09:30 on the day of the fixture's alerts, by a phone whose clock agrees with the server's (10:30).
+        val settings = AlertNotifySettings(true, NotifyThreshold.HIGH, 15, 1_826_271_000_000L)
+        val fetch = XapiGateway { 1_826_274_600_000L }.backgroundAlerts(profile, { authority, clock -> BackgroundAlerts.since(settings, null, authority, clock) }, BackgroundAlerts.wanted(settings))
+        val decision = BackgroundAlerts.decide(profile, settings, null, fetch)
         val batch = requireNotNull(AlertNotificationContent.batch(profile, fetch, decision.notify))
         assertEquals(listOf("Critical: HA host failed" to "Fixture pool · Host node-01", "High: SR space low" to "Fixture pool · Storage"),
             batch.items.map { it.title to it.text })
@@ -110,8 +115,34 @@ class BackgroundTransportIntegrationTest {
         listOf("203.0.113.5", "127.0.0.1", profile.username, profile.password, "OpaqueRef").forEach { assertFalse("leaked $it", text.contains(it)) }
     }
 
+    @Test fun theServersClockIsReadInTheSameSessionAndPairedWithThePhonesClock() = runBlocking {
+        serverTime = "20271115T10:30:00Z"
+        var seenAuthority: String? = null; var seenClock: ServerClock? = null
+        val fetch = XapiGateway { 1_900_000_000_000L }.backgroundAlerts(profile, { authority, clock -> seenAuthority = authority; seenClock = clock; 1 }) { false }
+        assertEquals("pool-id", seenAuthority)
+        // 2027-11-15 10:30:00 UTC, paired with the phone's clock (fixed here, so the midpoint is that value).
+        assertEquals(ServerClock(1_826_274_600_000L, 1_900_000_000_000L), seenClock)
+        assertEquals(seenClock, fetch.serverClock)
+        assertEquals(1, calls.count { it == "session.login_with_password" }); assertEquals(1, calls.count { it == "host.get_servertime" })
+    }
+
+    @Test fun aServerThatDoesNotAnswerItsClockStillWorksWhereTheClockIsNotNeeded() = runBlocking {
+        serverTime = null // the fixture answers UUID_INVALID
+        var seenClock: ServerClock? = ServerClock(0, 0)
+        val fetch = XapiGateway().backgroundAlerts(profile, { _, clock -> seenClock = clock; 1 }) { false }
+        assertNull(seenClock); assertNull(fetch.serverClock)
+        assertEquals(setOf("OpaqueRef:m1", "OpaqueRef:m2", "OpaqueRef:m3"), fetch.messages.map { it.ref }.toSet())
+    }
+
+    @Test fun aFirstCheckWithoutTheServersClockFailsBeforeReadingAnyAlerts() = runBlocking {
+        serverTime = null
+        val error = runCatching { XapiGateway().backgroundAlerts(profile, { authority, clock -> BackgroundAlerts.since(AlertNotifySettings(true, enabledAt = 5), null, authority, clock) }) { true } }.exceptionOrNull()
+        assertTrue(error is ServerTimeUnavailable)
+        assertTrue("message.get_since" !in calls); assertEquals("session.logout", calls.last()) // the session is still closed
+    }
+
     @Test fun aChangedPinFailsBeforeAnyCredentialIsSent() = runBlocking {
-        val error = runCatching { XapiGateway().backgroundAlerts(profile.copy(certificateSha256 = "0".repeat(64)), 1) { true } }.exceptionOrNull()
+        val error = runCatching { XapiGateway().backgroundAlerts(profile.copy(certificateSha256 = "0".repeat(64)), { _, _ -> 1 }) { true } }.exceptionOrNull()
         assertNotNull(error)
         assertTrue(PoolSummaries.certificateChanged(error!!))
         assertTrue(calls.isEmpty())
@@ -119,7 +150,7 @@ class BackgroundTransportIntegrationTest {
 
     @Test fun anAuthenticationFailureIsTypedAndNothingElseIsSent() = runBlocking {
         rpcErrors = mapOf("session.login_with_password" to ("SESSION_AUTHENTICATION_FAILED" to listOf("fixture-user")))
-        val error = runCatching { XapiGateway().backgroundAlerts(profile, 1) { true } }.exceptionOrNull()
+        val error = runCatching { XapiGateway().backgroundAlerts(profile, { _, _ -> 1 }) { true } }.exceptionOrNull()
         assertEquals("SESSION_AUTHENTICATION_FAILED", (error as RpcFailure).code)
         assertEquals(listOf("session.login_with_password"), calls.toList())
     }

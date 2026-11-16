@@ -31,6 +31,11 @@ enum class ConsoleFailureKind {
     FAILED,
 }
 
+/** What a console shows: a VM's screen, or an XCP-ng host's own screen (its control domain). Only wording depends on it here. */
+enum class ConsoleSubject(val possessive: String) {
+    VM("this VM's"), HOST("this host's");
+}
+
 /** A console failure with a user-presentable message. Messages never contain session references. */
 open class ConsoleError(message: String, val kind: ConsoleFailureKind = ConsoleFailureKind.FAILED) : Exception(message)
 
@@ -39,8 +44,10 @@ open class ConsoleError(message: String, val kind: ConsoleFailureKind = ConsoleF
  * no approved member pin (or its approved pin no longer matches). [certificate] is what the member
  * presented to a credential-free probe; [previousPin] is the pin approved earlier, if any.
  */
-class MemberTrustRequired(val authority: String, val certificate: ServerCertificate, val previousPin: String?) :
-    ConsoleError("This VM's console is served by a pool member whose certificate is not trusted yet.", ConsoleFailureKind.MEMBER_TRUST)
+class MemberTrustRequired(val authority: String, val certificate: ServerCertificate, val previousPin: String?,
+    subject: ConsoleSubject = ConsoleSubject.VM) :
+    ConsoleError("${subject.possessive.replaceFirstChar { it.uppercase() }} console is served by a pool member whose certificate is not trusted yet.",
+        ConsoleFailureKind.MEMBER_TRUST)
 
 object ConsoleFailures {
     /** Maps transport exceptions to a console error. A [ConsoleError] passes through unchanged. */

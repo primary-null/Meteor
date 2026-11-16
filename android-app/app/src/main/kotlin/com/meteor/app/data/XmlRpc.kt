@@ -44,15 +44,57 @@ object XmlRpc {
             arguments.joinToString("") { "<param><value>${value(it)}</value></param>" } + "</params></methodCall>").toByteArray(Charsets.UTF_8)
     }
 
+    // --- inventory scale ---
+    /** Byte limit of an answer read as one tree (unchanged). Pool-sized lists are streamed instead (InventoryScale.kt). */
+    const val MAX_TREE_BYTES = 8L * 1024 * 1024
+    /**
+     * Real XCP-ng 8.3 records cost ~14 bytes of XML per node tick (a 9.3 KB template is ~675 ticks), so 640,000 ticks
+     * lets the byte limit bind first for real answers (the old 150,000 failed at 222 VM records, 2 MiB). It still bounds
+     * the tree a hostile answer can make the phone build; see InventoryScaleTest for the measured cost per tick.
+     */
+    const val MAX_TREE_NODES = 640_000
+    /** UTF-8 length without copying the answer (the old check allocated a second 8 MiB array per call). */
+    internal fun utf8Length(text: String): Long {
+        var bytes = 0L
+        var i = 0
+        while (i < text.length) {
+            val c = text[i]
+            bytes += when {
+                c.code < 0x80 -> 1
+                c.code < 0x800 -> 2
+                Character.isHighSurrogate(c) && i + 1 < text.length && Character.isLowSurrogate(text[i + 1]) -> { i++; 4 }
+                else -> 3
+            }
+            i++
+        }
+        return bytes
+    }
+    // --- end inventory scale ---
+    /**
+     * A `<double>`. XAPI writes the non-finite values of data-source limits and samples as `inf`, `-inf` and `nan`
+     * (a real XCP-ng 8.3 answers `<double>inf</double>`), which Kotlin's own parser rejects. They are read as the
+     * matching IEEE values; every consumer must treat a non-finite value as "no limit" or "no sample".
+     */
+    internal fun parseDouble(text: String): Double {
+        val token = text.trim()
+        when (token.lowercase(java.util.Locale.ROOT)) {
+            "inf", "+inf", "infinity", "+infinity" -> return Double.POSITIVE_INFINITY
+            "-inf", "-infinity" -> return Double.NEGATIVE_INFINITY
+            "nan", "+nan", "-nan" -> return Double.NaN
+        }
+        return token.toDoubleOrNull() ?: throw IllegalArgumentException("Invalid XML-RPC number.")
+    }
+
     fun response(xml: String): Any? {
-        require(xml.toByteArray().size <= 8 * 1024 * 1024) { "Response is too large." }
+        require(utf8Length(xml) <= MAX_TREE_BYTES) { "Response is too large." } // inventory scale: same limit, no copy
         require(!xml.contains("<!DOCTYPE", true) && !xml.contains("<!ENTITY", true)) { "DTD and entities are not supported." }
         val parser = XmlPullParserFactory.newInstance().newPullParser().apply {
             setFeature(XmlPullParser.FEATURE_PROCESS_NAMESPACES, false)
             setInput(StringReader(xml))
         }
         var nodes = 0
-        fun tick() { require(++nodes <= 150_000) { "Response is too complex." } }
+        fun tick() { require(++nodes <= MAX_TREE_NODES) { "Response is too complex." } } // inventory scale: sized limit
+        val keys = HashMap<String, String>() // inventory scale: one String per distinct struct key
         fun nextTag(): Int { tick(); return parser.nextTag() }
         fun parseValue(depth: Int): Any? {
             require(depth <= 32) { "Response nesting is too deep." }
@@ -76,7 +118,7 @@ object XmlRpc {
                     while (nextTag() == XmlPullParser.START_TAG) {
                         parser.require(XmlPullParser.START_TAG, null, "member")
                         nextTag(); parser.require(XmlPullParser.START_TAG, null, "name")
-                        val key = parser.nextText()
+                        val key = parser.nextText().let { keys.getOrPut(it) { it } } // inventory scale
                         require(!map.containsKey(key)) { "Duplicate XML-RPC field." }
                         nextTag()
                         map[key] = parseValue(depth + 1)
@@ -95,7 +137,7 @@ object XmlRpc {
                 }
                 "boolean" -> parser.nextText().trim().let { require(it in listOf("0", "1")) { "Invalid XML-RPC boolean." }; it == "1" }
                 "int", "i4", "i8" -> parser.nextText().trim().toLongOrNull() ?: throw IllegalArgumentException("Invalid XML-RPC integer.")
-                "double" -> parser.nextText().trim().toDoubleOrNull() ?: throw IllegalArgumentException("Invalid XML-RPC number.")
+                "double" -> parseDouble(parser.nextText())
                 "string", "dateTime.iso8601", "base64" -> parser.nextText()
                 else -> throw IllegalArgumentException("Unsupported XML-RPC type.")
             }

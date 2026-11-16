@@ -38,8 +38,15 @@ class AlertsControllerTest {
         override suspend fun details(profile: Profile, authority: String, uuid: String): VmDetails = error("Unexpected details")
         override suspend fun <T> powerConnection(profile: Profile, action: suspend PowerConnection.() -> T): T = error("Alerts must never touch the power path")
     }
-    private class Fixture(scope: CoroutineScope, val state: MutableStateFlow<MeteorState>, val backend: Backend = Backend(), val seen: Seen = Seen()) {
-        val controller = AlertsController(scope, backend, state, seen) { backend.now }
+    /** The background check's notifications, as the Android notifier would be asked to remove them. */
+    private class Shade : AlertNotificationCleaner {
+        val profiles = mutableListOf<String>()
+        val alerts = mutableListOf<Pair<String, Set<String>>>()
+        override fun clearProfile(profileId: String) { profiles += profileId }
+        override fun clearAlerts(profileId: String, refs: Collection<String>) { alerts += profileId to refs.toSet() }
+    }
+    private class Fixture(scope: CoroutineScope, val state: MutableStateFlow<MeteorState>, val backend: Backend = Backend(), val seen: Seen = Seen(), val shade: Shade = Shade()) {
+        val controller = AlertsController(scope, backend, state, seen, shade) { backend.now }
     }
 
     @Test fun firstReadIsFullThenIncrementalFromTheServerCursorMinusTheOverlap() = runTest {
@@ -250,5 +257,59 @@ class AlertsControllerTest {
         f.state.value = f.state.value.copy(connected = true)
         f.controller.dismiss(emptyList()); runCurrent()                       // nothing chosen
         assertEquals(1, f.backend.dismissed.size)
+    }
+
+    // ---- B3: notifications follow the inbox ----
+    @Test fun openingTheInboxClearsThatProfilesAlertNotifications() = runTest {
+        val f = Fixture(backgroundScope, state())
+        f.backend.read = { listOf(alert("a", at = t0 + 10)) }
+        f.controller.refresh(); runCurrent()
+        assertTrue(f.shade.profiles.isEmpty()) // reading in the background of the app is not seeing
+        f.controller.markSeen()
+        assertEquals(listOf("fixture"), f.shade.profiles)
+        // Still cleared when nothing is newer than before, so notifications posted since a view do not linger.
+        f.controller.markSeen()
+        assertEquals(listOf("fixture", "fixture"), f.shade.profiles)
+    }
+
+    @Test fun anEmptyOrNotYetLoadedInboxClearsNothing() = runTest {
+        val f = Fixture(backgroundScope, state())
+        f.controller.markSeen()
+        assertTrue(f.shade.profiles.isEmpty())
+        f.backend.read = { emptyList() }
+        f.controller.refresh(); runCurrent()
+        f.controller.markSeen()
+        assertEquals(listOf("fixture"), f.shade.profiles) // an inbox that was loaded and shown, even if empty
+    }
+
+    @Test fun dismissingInTheAppCancelsTheNotificationsOfTheConfirmedAlertsOnly() = runTest {
+        val f = Fixture(backgroundScope, state())
+        f.backend.read = { listOf(alert("a", at = t0 + 10), alert("b", at = t0 + 20)) }
+        f.controller.refresh(); runCurrent()
+        f.backend.dismissal = { targets -> DismissOutcome(targets.map { DismissResult(it.ref, if (it.ref == "a") DismissStatus.REMOVED else DismissStatus.STILL_PRESENT) }) }
+        f.controller.dismiss(f.state.value.alerts!!.messages); runCurrent()
+        assertTrue(f.shade.alerts.all { it.first == "fixture" && it.second == setOf("a") })
+        assertTrue(f.shade.alerts.isNotEmpty())
+    }
+
+    @Test fun anAlertDeletedOnTheServerCancelsItsNotificationToo() = runTest {
+        val f = Fixture(backgroundScope, state())
+        f.backend.read = { listOf(alert("a", at = t0 + 10)) }
+        f.controller.refresh(); runCurrent()
+        f.controller.onMessageEvents(setOf("a"), full = false); runCurrent()
+        assertEquals(listOf("fixture" to setOf("a")), f.shade.alerts)
+    }
+
+    @Test fun aNotifierThatFailsNeverBreaksTheInbox() = runTest {
+        val broken = object : AlertNotificationCleaner {
+            override fun clearProfile(profileId: String) = throw IllegalStateException("notification service")
+            override fun clearAlerts(profileId: String, refs: Collection<String>) = throw IllegalStateException("notification service")
+        }
+        val s = state(); val backend = Backend(); backend.read = { listOf(alert("a", at = t0 + 10)) }
+        val controller = AlertsController(backgroundScope, backend, s, Seen(), broken) { backend.now }
+        controller.refresh(); runCurrent()
+        controller.markSeen()
+        controller.remove(setOf("a"))
+        assertTrue(s.value.alerts?.messages.orEmpty().isEmpty())
     }
 }

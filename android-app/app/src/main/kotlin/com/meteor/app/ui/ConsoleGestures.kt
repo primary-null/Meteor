@@ -4,11 +4,18 @@ import androidx.compose.foundation.gestures.awaitEachGesture
 import androidx.compose.foundation.gestures.awaitFirstDown
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.input.pointer.AwaitPointerEventScope
+import androidx.compose.ui.input.pointer.PointerEventType
+import androidx.compose.ui.input.pointer.PointerType
+import androidx.compose.ui.input.pointer.isPrimaryPressed
+import androidx.compose.ui.input.pointer.isSecondaryPressed
+import androidx.compose.ui.input.pointer.isTertiaryPressed
 import androidx.compose.ui.input.pointer.PointerInputChange
 import androidx.compose.ui.input.pointer.PointerInputScope
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.unit.dp
 import com.meteor.app.data.ConsoleInput
+import com.meteor.app.data.MouseTracker
+import com.meteor.app.data.PointerRules
 import com.meteor.app.data.RfbProtocol
 import com.meteor.app.data.ScrollAccumulator
 import com.meteor.app.data.ViewTransform
@@ -34,6 +41,8 @@ internal class ConsoleGestureHost(
     val mode: () -> TouchMode,
     val doubleTapZoom: () -> Boolean,
     val haptic: () -> Unit,
+    /** The button for the next tap: left, or middle once when the key bar's "Middle click" is armed (it disarms itself). */
+    val tapButton: () -> Int = { RfbProtocol.LEFT },
 )
 
 private enum class Outcome { TAP, DRAG, LONG_PRESS, TWO_FINGER, CANCEL }
@@ -41,11 +50,14 @@ private enum class Outcome { TAP, DRAG, LONG_PRESS, TWO_FINGER, CANCEL }
 /**
  * Touch handling for the console surface.
  *
- * - tap: left click at the mapped guest coordinate; a second tap soon after toggles fit / 1:1 zoom (or is another
- *   click when double-tap zoom is turned off, so the guest receives a double-click);
+ * - tap: left click at the mapped guest coordinate (middle click when armed); a second tap soon after toggles fit / 1:1
+ *   zoom (or is another click when double-tap zoom is turned off, so the guest receives a double-click);
  * - long press: right click (the button stays down while the finger does, so right-drags work);
  * - one-finger drag: by [TouchMode] either a button-held move, wheel scrolling, or panning;
  * - two fingers: pinching zooms around the fingers (and pans), moving them together scrolls the wheel.
+ *
+ * A pointer action that starts outside the guest picture (in the letterbox) is ignored; a drag that starts on the
+ * picture and leaves it keeps following the nearest edge. A physical mouse is handled by [consoleMouse] instead.
  */
 internal suspend fun PointerInputScope.consoleGestures(host: ConsoleGestureHost) {
     var lastTapTime = 0L
@@ -53,6 +65,7 @@ internal suspend fun PointerInputScope.consoleGestures(host: ConsoleGestureHost)
     val scrollStep = 36.dp.toPx()
     awaitEachGesture {
         val first = awaitFirstDown(requireUnconsumed = false)
+        if (first.type == PointerType.Mouse) return@awaitEachGesture // Buttons and wheel are mapped by consoleMouse.
         val slop = viewConfiguration.touchSlop
         val origin = first.position
         var outcome = Outcome.LONG_PRESS
@@ -77,11 +90,15 @@ internal suspend fun PointerInputScope.consoleGestures(host: ConsoleGestureHost)
                     host.setTransform(host.transform().toggleActualSize(origin.x, origin.y))
                 } else {
                     lastTapTime = upTime; lastTapPosition = origin
-                    val point = host.transform().toFramebuffer(origin.x, origin.y)
-                    host.input.click(RfbProtocol.LEFT, point.x, point.y)
+                    PointerRules.startPoint(host.transform(), origin.x, origin.y)?.let { point ->
+                        host.input.click(host.tapButton(), point.x, point.y)
+                    }
                 }
             }
-            Outcome.LONG_PRESS -> { host.haptic(); holdButton(host, first, origin, RfbProtocol.RIGHT) }
+            Outcome.LONG_PRESS -> {
+                if (host.transform().contains(origin.x, origin.y)) host.haptic()
+                holdButton(host, first, origin, RfbProtocol.RIGHT)
+            }
             Outcome.DRAG -> dragGesture(host, first, origin, scrollStep)
             Outcome.TWO_FINGER -> twoFingerGesture(host, scrollStep)
             Outcome.CANCEL -> Unit
@@ -89,9 +106,19 @@ internal suspend fun PointerInputScope.consoleGestures(host: ConsoleGestureHost)
     }
 }
 
-/** Holds [button] at the touch point and follows the finger until it lifts. */
+/** Waits for the finger to lift without sending anything. */
+private suspend fun AwaitPointerEventScope.ignoreUntilLifted(first: PointerInputChange) {
+    while (true) {
+        val change = awaitPointerEvent().changes.firstOrNull { it.id == first.id } ?: break
+        change.consume()
+        if (!change.pressed) break
+    }
+}
+
+/** Holds [button] at the touch point and follows the finger until it lifts. Nothing is sent when the touch began outside the picture. */
 private suspend fun AwaitPointerEventScope.holdButton(host: ConsoleGestureHost, first: PointerInputChange, origin: Offset, button: Int) {
-    val start = host.transform().toFramebuffer(origin.x, origin.y)
+    val start = PointerRules.startPoint(host.transform(), origin.x, origin.y)
+    if (start == null) { ignoreUntilLifted(first); return }
     host.input.buttonDown(button, start.x, start.y)
     try {
         while (true) {
@@ -109,7 +136,8 @@ private suspend fun AwaitPointerEventScope.dragGesture(host: ConsoleGestureHost,
         TouchMode.MOUSE -> holdButton(host, first, origin, RfbProtocol.LEFT)
         TouchMode.SCROLL -> {
             val vertical = ScrollAccumulator(scrollStep); val horizontal = ScrollAccumulator(scrollStep)
-            val anchor = host.transform().toFramebuffer(origin.x, origin.y)
+            val anchor = PointerRules.startPoint(host.transform(), origin.x, origin.y)
+            if (anchor == null) { ignoreUntilLifted(first); return }
             while (true) {
                 val change = awaitPointerEvent().changes.firstOrNull { it.id == first.id } ?: break
                 change.consume()
@@ -142,6 +170,7 @@ private suspend fun AwaitPointerEventScope.twoFingerGesture(host: ConsoleGesture
     var initialSpread = 0f; var previousSpread = 0f
     var initialCentroid = Offset.Zero; var previousCentroid = Offset.Zero
     var zooming: Boolean? = null
+    var startedOnPicture = false
     val vertical = ScrollAccumulator(scrollStep); val horizontal = ScrollAccumulator(scrollStep)
     var anyPressed = true
     while (true) {
@@ -153,6 +182,7 @@ private suspend fun AwaitPointerEventScope.twoFingerGesture(host: ConsoleGesture
         val spread = (pressed[0].position - pressed[1].position).getDistance().coerceAtLeast(1f)
         if (initialSpread == 0f) {
             initialSpread = spread; previousSpread = spread; initialCentroid = centroid; previousCentroid = centroid
+            startedOnPicture = host.transform().contains(centroid.x, centroid.y)
             continue
         }
         if (zooming == null) {
@@ -163,7 +193,7 @@ private suspend fun AwaitPointerEventScope.twoFingerGesture(host: ConsoleGesture
         val delta = centroid - previousCentroid
         when (zooming) {
             true -> host.setTransform(host.transform().panBy(delta.x, delta.y).zoomBy(spread / previousSpread, centroid.x, centroid.y))
-            false -> {
+            false -> if (startedOnPicture) {
                 val point = host.transform().toFramebuffer(centroid.x, centroid.y)
                 scroll(host, delta, vertical, horizontal, point.x, point.y)
             }
@@ -177,4 +207,31 @@ private suspend fun AwaitPointerEventScope.twoFingerGesture(host: ConsoleGesture
         event.changes.forEach { it.consume() }
         anyPressed = event.changes.any { it.pressed }
     }
+}
+
+/**
+ * A physical mouse (Samsung DeX, a tablet, a Bluetooth mouse): primary, secondary and tertiary buttons are RFB buttons
+ * 1, 3 and 2, the wheel is sent as scroll buttons and the guest pointer follows the mouse without a button held.
+ * Touch and stylus input keep using [consoleGestures]. Press and release events are consumed so the system does not
+ * turn a right click into Back.
+ */
+internal suspend fun PointerInputScope.consoleMouse(host: ConsoleGestureHost) {
+    val tracker = MouseTracker(host.input)
+    try {
+        awaitPointerEventScope {
+            while (true) {
+                val event = awaitPointerEvent()
+                val change = event.changes.firstOrNull { it.type == PointerType.Mouse } ?: continue
+                if (event.type == PointerEventType.Scroll) {
+                    tracker.scroll(change.scrollDelta.x, change.scrollDelta.y, change.position.x, change.position.y, host.transform())
+                    change.consume()
+                    continue
+                }
+                val buttons = event.buttons
+                val mask = PointerRules.mouseMask(buttons.isPrimaryPressed, buttons.isSecondaryPressed, buttons.isTertiaryPressed)
+                tracker.update(mask, change.position.x, change.position.y, host.transform())
+                if (mask != 0 || event.type == PointerEventType.Press || event.type == PointerEventType.Release) change.consume()
+            }
+        }
+    } finally { tracker.cancel() }
 }

@@ -8,7 +8,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 
 @Composable
-internal fun NoticeBanner(notice: UiNotice, dismiss: () -> Unit) {
+/** [dismiss] is null for a persistent status that goes away only when its cause does. */
+internal fun NoticeBanner(notice: UiNotice, dismiss: (() -> Unit)?) {
     val colors = MaterialTheme.colorScheme
     val (background, foreground) = when (notice.kind) {
         NoticeKind.INFO -> colors.surfaceContainerHigh to colors.onSurface
@@ -20,7 +21,7 @@ internal fun NoticeBanner(notice: UiNotice, dismiss: () -> Unit) {
         Column(Modifier.padding(12.dp)) {
             Text(notice.kind.title, style = MaterialTheme.typography.labelMedium)
             Text(notice.text, style = MaterialTheme.typography.bodySmall)
-            TextButton(onClick = dismiss) { Text("Dismiss", color = foreground) }
+            if (dismiss != null) TextButton(onClick = dismiss) { Text("Dismiss", color = foreground) }
         }
     }
 }

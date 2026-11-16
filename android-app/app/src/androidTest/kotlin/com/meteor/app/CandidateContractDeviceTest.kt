@@ -19,7 +19,7 @@ class CandidateContractDeviceTest {
         assertEquals("com.meteor.app.candidate", context.packageName)
         assertEquals("candidate", BuildConfig.BUILD_TYPE)
         assertFalse(BuildConfig.DEBUG)
-        assertTrue(BuildConfig.VERSION_NAME.endsWith("-rc2"))
+        assertTrue(BuildConfig.VERSION_NAME.endsWith("-rc" + BuildConfig.VERSION_CODE))
         assertEquals(0, context.applicationInfo.flags and ApplicationInfo.FLAG_DEBUGGABLE)
         val bootstrap = File(context.filesDir, "bootstrap.json")
         assumeFalse("An existing bootstrap fixture must be preserved", bootstrap.exists())

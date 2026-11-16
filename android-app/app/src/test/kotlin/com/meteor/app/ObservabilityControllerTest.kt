@@ -98,4 +98,13 @@ class ObservabilityControllerTest {
         assertEquals(other, state.value.metricTarget)
         assertEquals(listOf(other), state.value.metricSamples.map { it.target })
     }
+
+    // --- stop watching ---
+    @Test fun aWatchedOperationDoesNotHoldMetricsOrActivity() = runTest {
+        val state = state(); val backend = Backend(); val controller = ObservabilityController(backgroundScope, backend, state)
+        state.value = state.value.copy(operationBusy = true, operationWatching = true)
+        controller.openMetrics(target); controller.refreshActivity(); runCurrent()
+        assertEquals(2, backend.reads); assertEquals(1, state.value.metricSamples.size); assertNotNull(state.value.poolActivity)
+    }
+    // --- end stop watching ---
 }

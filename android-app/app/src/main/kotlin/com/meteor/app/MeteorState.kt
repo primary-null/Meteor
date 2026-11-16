@@ -37,6 +37,9 @@ data class MeteorState(
     // --- B2 storage/host ---
     val storageHost: StorageHostView = StorageHostView(),
     // --- end B2 storage/host ---
+    // --- VM settings ---
+    val vmSettings: VmSettingsView = VmSettingsView(),
+    // --- end VM settings ---
     // --- B3 background/summary ---
     /** Per-profile background notification preferences (local DataStore, not the encrypted profile document). */
     val alertNotify: Map<String, AlertNotifySettings> = emptyMap(),
@@ -49,6 +52,25 @@ data class MeteorState(
     /** A same-connection inventory re-read is in flight. Unlike [loading], it keeps [connected] and open dialogs. */
     val refreshing: Boolean = false,
     // --- end background refresh ---
+    // --- offline and reconnect ---
+    /** The phone has no default network. Shown instead of a server error; no automatic login is attempted meanwhile. */
+    val offline: Boolean = false,
+    /** Set while automatic reconnects are stopped until the user acts (rejected credentials, changed certificate, pool member). */
+    val retryStop: RetryStop? = null,
+    // --- end offline and reconnect ---
+    // --- stop watching ---
+    /**
+     * The running operation (still [operationBusy]) has been sent and is only being observed by its saved task UUID.
+     * Reads, browsing and connection changes that keep its identity are allowed meanwhile; writes stay locked. See [ControlGates].
+     */
+    val operationWatching: Boolean = false,
+    /** "Stop watching" was chosen; the observation ends at its next safe point. */
+    val operationStopping: Boolean = false,
+    // --- end stop watching ---
+    // --- vault recovery ---
+    /** Why the saved connections are unreadable, and whether Try again / Start over is running. Meaningful while [vaultProblem] is set. */
+    val vaultRecovery: VaultRecovery = VaultRecovery(),
+    // --- end vault recovery ---
 ) {
     val message get() = notice?.text
     val selectedProfile get() = profiles.firstOrNull { it.id == selectedId }

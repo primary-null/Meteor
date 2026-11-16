@@ -133,9 +133,17 @@ class HistoryTransportIntegrationTest {
         "PBD.get_all_records" -> mapOf("pbd-1" to mapOf("SR" to "sr-ref", "host" to "host-ref", "currently_attached" to true),
             "pbd-2" to mapOf("SR" to "sr-ref", "host" to "member-ref", "currently_attached" to false),
             "pbd-3" to mapOf("SR" to "another-sr", "host" to "host-ref", "currently_attached" to true))
-        "VBD.get_all_records" -> mapOf("vbd-use" to mapOf("VM" to "vm-ref"))
-        "VM.get_all_records" -> mapOf("vm-ref" to mapOf("name_label" to "Fixture VM"))
-        else -> error("Unexpected fixture request: $method")
+        // inventory scale: the pool-wide lists are only read filtered (by VM, by snapshot_of, by _ref), never whole
+        "VBD.get_all_records" -> mapOf("vbd-use" to mapOf("VM" to "vm-ref"),
+            "vbd-cd" to mapOf("VM" to "vm-ref", "type" to "CD", "userdevice" to "3", "empty" to false, "VDI" to "vdi-iso", "currently_attached" to true),
+            "vbd-disk" to mapOf("VM" to "vm-ref", "type" to "Disk", "userdevice" to "0", "empty" to false, "VDI" to "OpaqueRef:NULL", "currently_attached" to true))
+        "VM.get_all_records" -> mapOf("vm-ref" to vmRecord()) + List(snapshotCount) { "snap-$it" }.associateWith { ref ->
+            mapOf("uuid" to "snap-uuid-$ref", "name_label" to "Snapshot $ref", "is_a_snapshot" to true, "snapshot_of" to "vm-ref",
+                "snapshot_time" to "202601%02dT10:00:00Z".format(1 + ref.removePrefix("snap-").toInt())) }
+        // inventory scale: filtered reads answer from the same fixture records
+        else -> if (method.endsWith(".get_all_records_where")) @Suppress("UNCHECKED_CAST") XapiWhere.filter(
+            result(method.removeSuffix("_where"), args) as Map<String, Map<String, Any?>>, XapiWhere.unescape(args[1]))
+            else error("Unexpected fixture request: $method")
     }
 
     // ---- RRD bodies ----
@@ -172,8 +180,8 @@ class HistoryTransportIntegrationTest {
         assertEquals(listOf("session.login_with_password", "pool.get_all_records", "host.get_by_uuid", "host.get_record", "host.get_servertime",
             "GET /rrd_updates", "pool.get_all_records", "session.logout"), events.toList())
         val query = queries.single()
-        // Start comes from the server's clock (22:15:00Z), aligned to 5 s, even though this phone's clock is 50 s behind.
-        assertEquals(setOf("session_id=OpaqueRef:fixture-session", "start=1699999500", "cf=AVERAGE", "interval=5", "host=true", "json=true"), query.split('&').toSet())
+        // Start comes from the server's clock (22:15:00Z), aligned to 5 s and two steps inside the span, even though this phone's clock is 50 s behind.
+        assertEquals(setOf("session_id=OpaqueRef:fixture-session", "start=1699999510", "cf=AVERAGE", "interval=5", "host=true", "json=true"), query.split('&').toSet())
         assertEquals("application/json, application/xml;q=0.8", accepts.single())
         assertEquals("Meteor-Spark/${BuildConfig.VERSION_NAME}", agents.single())
         assertEquals(listOf(1_700_000_090L, 1_700_000_095L, 1_700_000_100L), snapshot.timestamps)
@@ -188,26 +196,28 @@ class HistoryTransportIntegrationTest {
         rrdBody = jsonBody(legend, listOf(1_700_000_040L to listOf("0.9", "0.4", "1024", "NaN", "0.2"), 1_700_000_100L to listOf("0.9", "0.6", "2048", "5", "0.3")))
         val snapshot = history(vmTarget, HistoryRange.TWO_HOURS)
         val query = queries.single().split('&').toSet()
-        assertTrue("start=1699992900" in query && "interval=60" in query && "host=true" !in query)
+        assertTrue("start=1699993020" in query && "interval=60" in query && "host=true" !in query)
+        assertTrue("one VM is asked for, so a busy host does not send every VM", "vm_uuid=$VM" in query)
         assertEquals(listOf(1_700_000_040L, 1_700_000_100L), snapshot.timestamps); assertEquals(60L, snapshot.stepSeconds)
         assertEquals(listOf(.4, .6), snapshot.series.single { it.id == "cpu_avg" }.values)
         assertEquals(listOf("cpu_avg", "memory", "vif_0_rx"), snapshot.series.map { it.id })
         assertTrue(snapshot.series.single { it.id == "vif_0_rx" }.values[0].isNaN())
         assertTrue(snapshot.notes.single().contains("guest tools"))
+        // The VM's two drives are read once to tell disks from CD drives.
         assertEquals(listOf("session.login_with_password", "pool.get_all_records", "pool.get_all_records", "VM.get_by_uuid", "VM.get_record",
-            "host.get_servertime", "GET /rrd_updates", "pool.get_all_records", "session.logout"), events.toList())
+            "VBD.get_record", "VBD.get_record", "host.get_servertime", "GET /rrd_updates", "pool.get_all_records", "session.logout"), events.toList())
     }
     @Test fun incrementalReadsAskOnlyForRowsAfterTheNewestOneHeld() {
         history(hostTarget, since = 1_700_000_095)
         assertTrue("start=1700000085" in queries.single().split('&'))
         queries.clear()
         history(hostTarget, since = 1_600_000_000)
-        assertTrue("a stale marker falls back to the whole window", "start=1699999500" in queries.single().split('&'))
+        assertTrue("a stale marker falls back to the whole window", "start=1699999510" in queries.single().split('&'))
     }
     @Test fun withoutAServerClockTheWindowIsMeasuredOnThePhone() {
         rpcErrors = mapOf("host.get_servertime" to "RBAC_PERMISSION_DENIED")
         val snapshot = history(hostTarget, now = 1_700_000_050_000L)
-        assertTrue("start=1699999450" in queries.single().split('&'))
+        assertTrue("start=1699999460" in queries.single().split('&'))
         assertNull(snapshot.serverTimeSeconds)
     }
     @Test fun vmOnAMemberHostIsUnavailableAndNoRrdRequestIsSent() {
@@ -271,8 +281,8 @@ class HistoryTransportIntegrationTest {
 
     @Test fun hostInfoReadsRecordPifsMetricsAndTheServerClockInOneSession() {
         val info = runBlocking { gateway().hostInfo(profile, "pool-id", hostUuid) }
-        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "host.get_by_uuid", "host.get_record", "PIF.get_all_records",
-            "PIF_metrics.get_all_records", "host.get_servertime", "pool.get_all_records", "session.logout"), events.toList())
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "host.get_by_uuid", "host.get_record", "PIF.get_all_records_where",
+            "PIF_metrics.get_all_records", "host.get_servertime", "pool.get_all_records", "session.logout"), events.toList()) // inventory scale: this host's PIFs only
         assertTrue(info.coordinator); assertEquals("Fixture CPU", info.cpuModel); assertEquals("8.3.0", info.productVersion)
         assertEquals(listOf("eth0"), info.nics.map { it.device })
         assertEquals(true, info.nics.single().carrier); assertEquals(1000L, info.nics.single().speedMbit)
@@ -302,18 +312,21 @@ class HistoryTransportIntegrationTest {
         assertEquals(45, info.totalVdis); assertEquals(StorageMapper.MAX_VDIS, info.vdis.size)
         assertEquals(listOf("Fixture VM"), info.vdis.first().attachedVms)
         assertEquals(listOf("Not attached on xcp-b"), info.warnings); assertTrue(info.overProvisioned)
-        assertTrue(methods.containsAll(listOf("PBD.get_all_records", "VBD.get_all_records", "VM.get_all_records")))
+        // inventory scale: the repository's PBDs and only the shown disks' VBDs and VMs, filtered on the server
+        assertTrue(methods.containsAll(listOf("PBD.get_all_records_where", "VBD.get_all_records_where", "VM.get_all_records_where")))
+        assertTrue(methods.none { it == "PBD.get_all_records" || it == "VBD.get_all_records" || it == "VM.get_all_records" })
         assertEquals("session.logout", events.last())
         events.clear(); vdiHasVbd = false; vdiCount = 2
         val idle = runBlocking { gateway().storageInfo(profile, "pool-id", "sr-id") }
         assertTrue(idle.vdis.all { it.attachedVms.isEmpty() })
-        assertTrue(methods.none { it == "VBD.get_all_records" || it == "VM.get_all_records" })
+        assertTrue(methods.none { it.startsWith("VBD.get_all_records") || it.startsWith("VM.get_all_records") })
     }
     @Test fun vmInfoReadsOnlyThisVmsSnapshotsAndDrivesAndCapsSnapshots() {
         snapshotCount = 3
         val info = runBlocking { gateway().vmInfo(profile, "pool-id", vmUuid) }
+        // inventory scale: one filtered read for all snapshots and one for all drives, instead of one record read each
         assertEquals(listOf("session.login_with_password", "pool.get_all_records", "pool.get_all_records", "VM.get_by_uuid", "VM.get_record",
-            "VM.get_record", "VM.get_record", "VM.get_record", "VBD.get_record", "VBD.get_record", "VDI.get_record", "pool.get_all_records", "session.logout"), events.toList())
+            "VM.get_all_records_where", "VBD.get_all_records_where", "VDI.get_record", "pool.get_all_records", "session.logout"), events.toList())
         assertEquals("UEFI", info.firmware); assertEquals(SecureBoot.ON, info.secureBoot); assertEquals(false, info.vtpm)
         assertEquals(3, info.snapshotCount); assertEquals("Snapshot snap-2", info.snapshots.first().name)
         assertEquals(listOf(VmCdDrive("3", false, "debian.iso", true)), info.cdDrives)
@@ -321,7 +334,9 @@ class HistoryTransportIntegrationTest {
         events.clear(); snapshotCount = 30
         val many = runBlocking { gateway().vmInfo(profile, "pool-id", vmUuid) }
         assertEquals(30, many.snapshotCount); assertEquals(VmInfoMapper.MAX_SNAPSHOTS, many.snapshots.size)
-        assertEquals(VmInfoMapper.MAX_SNAPSHOTS + 1, methods.count { it == "VM.get_record" })
+        assertEquals(1, methods.count { it == "VM.get_record" }); assertEquals(1, methods.count { it == "VM.get_all_records_where" })
+        // the shown ones are the newest of all 30, not the first 20 references
+        assertEquals((29 downTo 10).map { "Snapshot snap-$it" }, many.snapshots.map { it.name })
     }
     @Test fun detailReadsRejectAnotherPoolAndPinMismatchesSendNothing() {
         assertTrue(failure { runBlocking { gateway().vmInfo(profile, "someone-elses-pool", vmUuid) } } is IllegalArgumentException)

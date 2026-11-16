@@ -183,7 +183,7 @@ object AlertMerge {
             .values.sortedWith(AlertMapper.NEWEST_FIRST)
         val cursor = listOfNotNull(previous.cursor, fetch.messages.mapNotNull { it.timestamp }.maxOrNull()).maxOrNull()
         return previous.copy(messages = merged.take(MAX_KEPT), cursor = cursor, syncedAt = fetch.observedAt,
-            truncated = previous.truncated || merged.size > MAX_KEPT)
+            truncated = previous.truncated || merged.size > MAX_KEPT || fetch.truncated) // inventory scale: a capped get_since says so
     }
 
     fun remove(inbox: AlertInbox, refs: Set<String>): AlertInbox =

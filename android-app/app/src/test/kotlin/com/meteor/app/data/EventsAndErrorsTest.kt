@@ -64,6 +64,8 @@ class EventsAndErrorsTest {
     @Test fun failuresAreClassifiedForResyncReloginAndBackoff() {
         assertEquals(EventFailureKind.EVENTS_LOST, EventFailures.classify(RpcFailure("EVENTS_LOST")))
         assertEquals(EventFailureKind.SESSION_INVALID, EventFailures.classify(RpcFailure("SESSION_INVALID")))
+        // A token the server cannot parse (what XCP-ng 8.3 answers for a malformed one) is handled like lost events.
+        assertEquals(EventFailureKind.EVENTS_LOST, EventFailures.classify(RpcFailure("EVENT_FROM_TOKEN_PARSE_FAILURE", details = listOf("token"))))
         for (code in listOf("HOST_IS_SLAVE", "SESSION_AUTHENTICATION_FAILED", "RBAC_PERMISSION_DENIED"))
             assertEquals(EventFailureKind.SLOW, EventFailures.classify(RpcFailure(code)))
         assertEquals(EventFailureKind.SLOW, EventFailures.classify(UnsupportedOperationException()))

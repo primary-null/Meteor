@@ -114,7 +114,8 @@ class ObservabilityUiDeviceTest {
             compose.onNodeWithText("Back", substring = false).performClick()
             compose.onNodeWithText("VMs", useUnmergedTree = true).performClick()
             compose.onNodeWithTag("fleet-list").performScrollToNode(hasText(target.name))
-            compose.onNodeWithText(target.name).performClick()
+            // A running VM's row opens its console; its Details button opens the details.
+            compose.onNodeWithContentDescription("Details for ${target.name}").performClick()
             compose.onNodeWithText("VM performance").performScrollTo().performClick()
             compose.waitUntil(15_000) { model?.state?.value?.metricTarget?.kind == MetricKind.VM && model?.state?.value?.metricsBusy == false }
             compose.onNodeWithText("Live performance").assertIsDisplayed()

@@ -271,4 +271,18 @@ class DetailsControllerTest {
         f.controller.load(profile, "pool", "vm"); runCurrent() // manual "Refresh details" after a migration finished
         assertEquals(listOf("pool" to "vm"), f.changed)
     }
+
+    // --- stop watching ---
+    @Test fun aWatchedOperationLetsDetailsLoadAndPollButNeverOpensAConfirmation() = runTest {
+        val f = Fixture(backgroundScope, state(details = null).also { it.value = it.value.copy(operationBusy = true, operationWatching = true) })
+        f.backend.onDetails = { detail() }; f.backend.onPoll = { it.copy(observedAt = 6000) }
+        f.controller.load(profile, "pool", "vm"); runCurrent()
+        assertEquals(1, f.backend.fullReads); assertNotNull(f.state.value.details); assertFalse(f.state.value.detailsBusy)
+        f.controller.refresh(); runCurrent()
+        assertEquals(1, f.backend.polls)
+        f.controller.load(profile, "pool", "vm", PowerAction.SHUTDOWN); runCurrent()
+        assertEquals("a confirmation still waits for the operation", 1, f.backend.fullReads); assertNull(f.state.value.pendingPower)
+        assertFalse(ControlGates.vmActionsReady(f.state.value))
+    }
+    // --- end stop watching ---
 }

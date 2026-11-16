@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><methodCall><methodName>task.get_record</methodName><params><param><value><string>OpaqueRef:d34b196d-1927-43ee-8f33-f5a8511e3bf7</string></value></param><param><value><string>OpaqueRef:67e792a3-d58b-45a2-b8d4-6f60cc7ace24</string></value></param></params></methodCall>

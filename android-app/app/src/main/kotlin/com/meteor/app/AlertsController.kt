@@ -21,6 +21,9 @@ internal class AlertsController(
     private val gateway: MeteorGateway,
     private val state: MutableStateFlow<MeteorState>,
     private val seen: AlertSeenStore,
+    // --- B3 background/summary --- Alert notifications posted by the background check follow what the inbox shows.
+    private val notifications: AlertNotificationCleaner? = null,
+    // --- end B3 ---
     private val explain: (Throwable) -> String = ErrorReasons::reason,
     private val clock: () -> Long = System::currentTimeMillis,
 ) {
@@ -101,13 +104,21 @@ internal class AlertsController(
     fun remove(refs: Set<String>) {
         if (refs.isEmpty()) return
         state.update { current -> current.copy(alerts = current.alerts?.let { AlertMerge.remove(it, refs) }) }
+        state.value.selectedProfile?.let { clearNotifications(it.id, refs) } // B3: an alert deleted on the server no longer needs its notification
     }
+
+    // --- B3 background/summary ---
+    private fun clearNotifications(profileId: String, refs: Set<String>) {
+        if (refs.isNotEmpty()) runCatching { notifications?.clearAlerts(profileId, refs) }
+    }
+    // --- end B3 ---
 
     /** Called while the Alerts screen shows the list: records the newest server timestamp on screen as seen. */
     fun markSeen() {
         val current = state.value
         val profile = current.selectedProfile ?: return
         val inbox = current.currentAlerts ?: return
+        runCatching { notifications?.clearProfile(profile.id) } // B3: the inbox is showing this profile's alerts, so its notifications are spent
         val advanced = AlertSeen.advance(inbox.lastSeen, AlertSeen.newest(inbox)) ?: return
         if (advanced == inbox.lastSeen) return
         state.update { latest ->
@@ -129,6 +140,7 @@ internal class AlertsController(
             try {
                 val outcome = gateway.dismissAlerts(target.profile, target.authority, chosen.map { AlertTarget(it.ref, it.uuid) })
                 if (stillCurrent(target)) remove(outcome.removed)
+                clearNotifications(target.profile.id, outcome.removed) // B3: also when the user has since switched profile
                 state.update { it.copy(notice = DismissNotices.of(outcome, chosen.size)) }
             } catch (error: Exception) {
                 if (error is CancellationException) throw error

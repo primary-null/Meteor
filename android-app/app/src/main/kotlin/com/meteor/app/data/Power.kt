@@ -1,7 +1,14 @@
 package com.meteor.app.data
 
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import java.security.MessageDigest
@@ -81,8 +88,15 @@ enum class PowerAction(val title: String, val operation: String, val before: Str
      * A B2 storage/host record: the kind is [PowerOperation.targetAction]. Not requestable, so the
      * VM send, VM verification and VM review paths always refuse it. Never written to the journal.
      */
-    TARGET("Storage or host action", "", "", "", allowedFrom = emptySet(), requestable = false);
+    TARGET("Storage or host action", "", "", "", allowedFrom = emptySet(), requestable = false),
     // --- end B2 storage/host ---
+    // --- VM settings ---
+    /**
+     * A VM settings record (journal `action` "VM_SETTINGS", see VmSettings.kt). Not requestable, so the VM send, VM
+     * verification and task paths always refuse it. Never written to the journal under this name.
+     */
+    SETTINGS("Edit settings", "", "", "", allowedFrom = emptySet(), requestable = false);
+    // --- end VM settings ---
 
     // --- A2 operations ---
     val xapiMethod: String get() = "Async.VM.$operation"
@@ -123,6 +137,13 @@ data class PowerOperation(
     val argumentName: String? = null,
     val marker: Map<String, String>? = null, val steps: List<OperationStep>? = null,
     // --- end B2 storage/host ---
+    // --- journaled operation hardening ---
+    /** The server task's latest progress estimate while tracking. Shown only; never journaled and never proof. */
+    val progress: Double? = null,
+    // --- end journaled operation hardening ---
+    // --- VM settings --- The journaled setter calls of a settings record, in sending order.
+    val settings: List<SettingStep>? = null,
+    // --- end VM settings ---
 ) {
     init {
         require(manualResolution == null || (phase == PowerPhase.UNKNOWN && manualResolution.reviewedAt > 0 &&
@@ -134,12 +155,34 @@ data class PowerOperation(
         require(targetAction == null || (foreign == null && !targetUuid.isNullOrBlank())) { "Storage/host record needs a target." }
     }
     // --- end B2 storage/host ---
+    // --- VM settings ---
+    init {
+        require((action == PowerAction.SETTINGS) == (settings != null)) { "Settings kind mismatch." }
+        require(settings == null || (foreign == null && targetAction == null && vmUuid.isNotBlank())) { "Settings record needs a VM." }
+    }
+    // --- end VM settings ---
     val unresolved get() = manualResolution == null && phase !in setOf(PowerPhase.SUCCEEDED, PowerPhase.FAILED)
 }
 
 /** Separate from task success: the original action and its unknown outcome are retained. */
 data class ManualResolution(val reviewedAt: Long, val origin: String, val power: String, val bootTime: String?)
-data class PowerReview(val operation: PowerOperation, val profileId: String, val origin: String, val details: VmDetails)
+// --- journaled operation hardening ---
+/**
+ * What a manual review could read. [VM]: the original VM, in [PowerReview.details]. [VM_MISSING]: the
+ * original pool answered, but the VM no longer exists (explicit UUID_INVALID). [POOL_ONLY]: a record this
+ * version cannot interpret and that names no VM, so only the original pool identity was checked.
+ */
+enum class ReviewSubject { VM, VM_MISSING, POOL_ONLY }
+// --- end journaled operation hardening ---
+data class PowerReview(val operation: PowerOperation, val profileId: String, val origin: String, val details: VmDetails?,
+    // --- journaled operation hardening ---
+    val subject: ReviewSubject = ReviewSubject.VM, val observedAt: Long = details?.observedAt ?: 0L,
+    // --- VM settings --- For a settings record: the fresh settings read shown next to the recorded values.
+    val settings: VmSettings? = null,
+) {
+    init { require((subject == ReviewSubject.VM) == (details != null)) { "Review subject mismatch." } }
+    // --- end journaled operation hardening ---
+}
 data class PowerConfirmation(val profileId: String, val origin: String, val details: VmDetails, val action: PowerAction,
     // --- A2 operations ---
     val targetHost: HostChoice? = null, val typedName: String? = null,
@@ -252,25 +295,58 @@ interface PowerConnection {
     /** Sends one delete sub-step after re-checking at send time that it is a snapshot object ([NotSent] otherwise). */
     suspend fun submitStep(authority: String, step: OperationStep): String = throw UnsupportedOperationException("Storage/host sends are unavailable.")
     // --- end B2 storage/host ---
+    // --- journaled operation hardening ---
+    /**
+     * The VM state that tracking, recovery and review need (power, resident host, boot marker, current and
+     * allowed operations), without the disks, interfaces and guest metrics of [details]. The pool identity is
+     * confirmed first. Null only when, after that, the server explicitly answers UUID_INVALID for the VM.
+     * Every other failure throws. The default reads [details] and never reports a missing VM.
+     */
+    suspend fun vmState(authority: String, uuid: String): VmDetails? = details(authority, uuid)
+    /** Confirms that this connection reaches exactly the pool [authority]; throws otherwise. */
+    suspend fun verifyPoolIdentity(authority: String): Unit = throw UnsupportedOperationException("Pool reads are unavailable.")
+    // --- end journaled operation hardening ---
+    // --- VM settings ---
+    /** Fresh settings read; the pool identity is confirmed first. Null only when the server answers UUID_INVALID for the VM. */
+    suspend fun settings(authority: String, uuid: String): VmSettings? = throw UnsupportedOperationException("Settings reads are unavailable.")
+    /** Sends one setter once. Read-only checks before the call fail as [NotSent]; the call itself is never repeated. */
+    suspend fun submitSetting(authority: String, uuid: String, step: SettingStep): Unit = throw UnsupportedOperationException("Settings writes are unavailable.")
+    // --- end VM settings ---
 }
 interface PowerBackend {
     suspend fun <T> powerConnection(profile: Profile, action: suspend PowerConnection.() -> T): T
 }
 
-/** All sends are journaled once. Recovery observes only and never calls submit. */
+/**
+ * All sends are journaled once. Recovery observes only and never calls submit.
+ * Tracking follows [TrackingPolicy] per kind; a non-null [attempts] instead fixes the number of observations (tests).
+ */
 class PowerService(
     private val backend: PowerBackend, private val store: OperationStore,
     private val clock: () -> Long = System::currentTimeMillis,
-    private val wait: suspend () -> Unit = { delay(1500) }, private val attempts: Int = 80,
+    private val wait: suspend (Long) -> Unit = { delay(it) }, private val attempts: Int? = null,
+    private val failureTolerance: Int = TrackingPolicy.TRANSIENT_FAILURES,
 ) {
     // Multiple activities/viewmodels still share one submit gate in this app process.
-    private companion object { val processMutex = Mutex() }
+    private companion object {
+        val processMutex = Mutex()
+        // --- journaled operation hardening ---
+        const val VM_GONE = "The VM no longer exists on this pool, so the original task outcome cannot be verified. " +
+            "Review this record to close it; nothing will be resent."
+        const val VM_GONE_CLOSED = "Closed after manual review: the VM no longer exists on this pool. " +
+            "Original task outcome remains unverified. No action was resent."
+        const val POOL_ONLY_CLOSED = "Closed after manual review: unknown outcome. This version of Meteor cannot interpret the recorded action, " +
+            "so only the pool identity was checked. No action was resent."
+        // --- end journaled operation hardening ---
+    }
     // A failed disk cannot durably retain a ticket. Keep it for a later write in this process.
     private var retainedTicket: PowerOperation? = null
     private suspend fun save(op: PowerOperation, changed: suspend (PowerOperation) -> Unit): PowerOperation {
         val updated = op.copy(updatedAt = clock())
         if (updated.taskRef != null) retainedTicket = updated
-        store.put(updated); changed(updated); return updated
+        // Stop watching: a cancellation never splits a journal write from its publication.
+        withContext(NonCancellable) { store.put(updated); changed(updated) }
+        return updated
     }
     suspend fun execute(profile: Profile, confirmation: PowerConfirmation, changed: suspend (PowerOperation) -> Unit = {}): PowerOperation = processMutex.withLock {
         require(store.load().none { it.unresolved }) { "Resolve the pending operation before sending another." }
@@ -299,10 +375,15 @@ class PowerService(
                 op = save(op, changed)
             } catch (error: Exception) {
                 if (error is CancellationException) throw error
-                // An explicit XAPI rejection before a task ticket is definitive. Anything else is uncertain.
-                val rejected = error is RpcFailure && error.explicitRejection && op.taskRef == null
+                // An explicit XAPI rejection before a task ticket is definitive, and so is a send-time check that
+                // failed before the write call ([NotSent], journaled operation hardening). Anything else is uncertain.
+                val rejected = (error is RpcFailure && error.explicitRejection || error is NotSent) && op.taskRef == null
                 return@powerConnection save(op.copy(phase = if (rejected) PowerPhase.FAILED else PowerPhase.UNKNOWN,
-                    message = if (rejected) "Server rejected the request (${error.code})." else "Result unknown. Check status; do not repeat the action."), changed)
+                    message = when {
+                        error is NotSent && rejected -> "Not sent: ${error.message}"
+                        rejected -> "Server rejected the request (${(error as RpcFailure).code})."
+                        else -> "Result unknown. Check status; do not repeat the action."
+                    }), changed)
             }
             track(this, op, changed)
         }
@@ -313,6 +394,9 @@ class PowerService(
         // --- B2 storage/host --- Target records reconcile through their own object reads, never the VM path.
         if (persisted.targetAction != null && persisted.foreign == null) return@withLock reconcileTarget(profile, persisted, changed)
         // --- end B2 storage/host ---
+        // --- VM settings --- Settings records have no task; they reconcile by reading the fields back, never by resending.
+        if (persisted.settings != null && persisted.foreign == null) return@withLock reconcileSettings(profile, persisted, changed)
+        // --- end VM settings ---
         // --- A2 operations --- A record this version cannot interpret is never observed, verified or resent.
         require(persisted.foreign == null && persisted.action.requestable) {
             "This action was recorded by a different Meteor version. Review it manually; it will not be checked or resent automatically."
@@ -339,7 +423,9 @@ class PowerService(
         try {
             backend.powerConnection(profile) {
                 // Reads the pool/VM identity before looking at a task from the saved origin.
-                details(latest.authority, latest.vmUuid)
+                // --- journaled operation hardening --- A VM deleted elsewhere can only be closed by manual review.
+                vmState(latest.authority, latest.vmUuid) ?: return@powerConnection save(latest.copy(phase = PowerPhase.UNKNOWN, message = VM_GONE), changed)
+                // --- end journaled operation hardening ---
                 val ref = latest.taskUuid?.let { taskReference(it) } ?: requireNotNull(latest.taskRef)
                 val identity = latest.taskUuid ?: taskUuid(ref)
                 val resumed = save(latest.copy(taskRef = ref, taskUuid = identity), changed)
@@ -355,8 +441,20 @@ class PowerService(
         require(latest.unresolved) { "This operation is already closed." }
         require(latest.targetAction == null) { "Review this storage or host action from its own record." } // --- B2 storage/host ---
         backend.powerConnection(profile) {
-            val current = details(latest.authority, latest.vmUuid)
+            // --- journaled operation hardening ---
+            // A record this version cannot interpret and that names no VM: only the original pool is checked.
+            if (poolOnlyReview(latest)) {
+                verifyPoolIdentity(latest.authority)
+                return@powerConnection PowerReview(latest, profile.id, profile.origin(), null, ReviewSubject.POOL_ONLY, clock())
+            }
+            val current = vmState(latest.authority, latest.vmUuid)
+                ?: return@powerConnection PowerReview(latest, profile.id, profile.origin(), null, ReviewSubject.VM_MISSING, clock())
+            // --- end journaled operation hardening ---
             requireReviewIdentity(latest, current)
+            // --- VM settings ---
+            if (latest.settings != null && latest.foreign == null)
+                return@powerConnection PowerReview(latest, profile.id, profile.origin(), current, settings = settings(latest.authority, latest.vmUuid))
+            // --- end VM settings ---
             PowerReview(latest, profile.id, profile.origin(), current)
         }
     }
@@ -367,11 +465,37 @@ class PowerService(
         require(latest == review.operation && latest.unresolved) { "Operation changed. Review it again." }
         require(latest.targetAction == null) { "Review this storage or host action from its own record." } // --- B2 storage/host ---
         require(profile.id == review.profileId && profile.origin() == review.origin) { "Connection changed. Review it again." }
-        require(clock() - review.details.observedAt in 0..30_000) { "Review expired. Read the VM again." }
+        require(clock() - review.observedAt in 0..30_000) { "Review expired. Read the VM again." }
         backend.powerConnection(profile) {
-            val current = details(latest.authority, latest.vmUuid)
+            // --- journaled operation hardening ---
+            when (review.subject) {
+                ReviewSubject.POOL_ONLY -> {
+                    require(poolOnlyReview(latest)) { "Operation changed. Review it again." }
+                    verifyPoolIdentity(latest.authority)
+                    return@powerConnection save(latest.copy(phase = PowerPhase.UNKNOWN,
+                        manualResolution = ManualResolution(clock(), profile.origin(), "Not interpreted", null), message = POOL_ONLY_CLOSED), changed)
+                }
+                ReviewSubject.VM_MISSING -> {
+                    require(vmState(latest.authority, latest.vmUuid) == null) { "The VM exists again. Review it again." }
+                    return@powerConnection save(latest.copy(phase = PowerPhase.UNKNOWN,
+                        manualResolution = ManualResolution(clock(), profile.origin(), "VM no longer exists", null), message = VM_GONE_CLOSED), changed)
+                }
+                ReviewSubject.VM -> Unit
+            }
+            val reviewed = requireNotNull(review.details)
+            val current = vmState(latest.authority, latest.vmUuid) ?: throw IllegalArgumentException("The VM no longer exists. Review it again.")
+            // --- end journaled operation hardening ---
             requireReviewIdentity(latest, current)
-            require(current.power == review.details.power && current.bootTime == review.details.bootTime) { "VM changed. Review it again." }
+            require(current.power == reviewed.power && current.bootTime == reviewed.bootTime) { "VM changed. Review it again." }
+            // --- VM settings --- a settings record has no task; its closure names the fields' current values instead.
+            if (latest.settings != null && latest.foreign == null) {
+                val now = settings(latest.authority, latest.vmUuid) ?: throw IllegalArgumentException("The VM no longer exists. Review it again.")
+                require(review.settings == null || now.fence == review.settings.fence) { "The VM changed. Review it again." }
+                return@powerConnection save(latest.copy(phase = PowerPhase.UNKNOWN,
+                    manualResolution = ManualResolution(clock(), profile.origin(), SettingsText.reviewState(latest, now).take(200), current.bootTime),
+                    message = SettingsText.closedAfterReview(latest, now)), changed)
+            }
+            // --- end VM settings ---
             save(latest.copy(phase = PowerPhase.UNKNOWN, manualResolution = ManualResolution(clock(), profile.origin(), current.power, current.bootTime),
                 message = "Closed after manual review: ${current.power}. Original task outcome remains unverified. No action was resent."), changed)
         }
@@ -380,6 +504,77 @@ class PowerService(
         require(current.authority == operation.authority && current.uuid == operation.vmUuid) { "Original pool and VM required." }
         require(!current.currentOperations) { "The VM still has an active operation. Check status later." }
     }
+    // --- journaled operation hardening ---
+    private fun poolOnlyReview(operation: PowerOperation) = operation.foreign != null && operation.vmUuid.isBlank()
+    /**
+     * Observes until [step] returns a result. Returns null (still unverified) once the kind's budget is spent,
+     * once the read-back has not converged [TrackingPolicy.VERIFY_MILLIS] after the task finished, after more
+     * than [failureTolerance] consecutive transient failures, or at once on any other failure. Only [step]'s
+     * own read-back can produce a success. Cancellation propagates.
+     */
+    private suspend fun <T : Any> observe(current: () -> PowerOperation, step: suspend () -> T?): T? {
+        val budget = TrackingPolicy.budgetMillis(current())
+        var spent = 0L; var verifying = 0L; var failures = 0; var polls = 0
+        while (true) {
+            try {
+                step()?.let { return it }
+                failures = 0
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                if (!TrackingPolicy.transient(error) || ++failures > failureTolerance) return null
+            }
+            val pause = TrackingPolicy.interval(polls++)
+            val fixed = attempts
+            if (fixed != null) { if (polls >= fixed) return null }
+            else {
+                if (spent + pause > budget) return null
+                if (current().phase == PowerPhase.VERIFYING) { verifying += pause; if (verifying > TrackingPolicy.VERIFY_MILLIS) return null }
+            }
+            wait(pause); spent += pause
+        }
+    }
+    // --- stop watching ---
+    /**
+     * [observe] as a child job of the run, when the caller supplied a [TrackingWatch] in the coroutine context.
+     * "Stop watching" cancels only that child: never a journal write (see [save]) and never a send, which all
+     * happen outside it. The record is then saved as still unverified from its journaled state and
+     * [StopWatching] propagates, so no other branch records an outcome.
+     */
+    private suspend fun <T : Any> poll(current: () -> PowerOperation, changed: suspend (PowerOperation) -> Unit, step: suspend () -> T?): T? {
+        val watch = currentCoroutineContext()[TrackingWatch] ?: return observe(current, step)
+        if (watch.stopRequested) stopWatching(current().id, changed)
+        return coroutineScope {
+            // Each observation starts by checking for a stop: the gateway's reads block rather than suspend.
+            val observer = async { observe(current) { currentCoroutineContext().ensureActive(); step() } }
+            watch.attach(observer)
+            try { observer.await() }
+            catch (error: CancellationException) {
+                ensureActive() // the run itself was cancelled: that is not a stop
+                if (watch.stopRequested) stopWatching(current().id, changed) else throw error
+            } finally { watch.detach(observer) }
+        }
+    }
+    /**
+     * Saves the stopped record as UNKNOWN (still unresolved) and throws [StopWatching]. The journal, not the loop's
+     * copy, is the base, so a result that was proven and saved just before the stop is never overwritten.
+     */
+    private suspend fun stopWatching(id: String, changed: suspend (PowerOperation) -> Unit): Nothing {
+        withContext(NonCancellable) {
+            val latest = store.load().singleOrNull { it.id == id }
+            if (latest != null && OperationWatch.stoppable(latest))
+                save(latest.copy(phase = PowerPhase.UNKNOWN, progress = null, message = OperationWatch.stoppedMessage(latest)), changed)
+        }
+        throw StopWatching()
+    }
+    // --- end stop watching ---
+    /** Publishes a changed server progress estimate without writing the journal. */
+    private suspend fun showProgress(op: PowerOperation, task: TaskObservation, shown: Double?, changed: suspend (PowerOperation) -> Unit): Double? {
+        val progress = TrackingPolicy.shownProgress(task.progress) ?: return shown
+        if (shown != null && (progress * 100).toInt() == (shown * 100).toInt()) return shown
+        changed(op.copy(progress = progress))
+        return progress
+    }
+    // --- end journaled operation hardening ---
     // --- A2 operations ---
     private fun verifiedMessage(op: PowerOperation, current: VmDetails): String = when {
         op.action == PowerAction.REBOOT -> "Reboot verified: boot timestamp changed."
@@ -390,25 +585,31 @@ class PowerService(
     // --- end A2 operations ---
     private suspend fun track(connection: PowerConnection, initial: PowerOperation, changed: suspend (PowerOperation) -> Unit): PowerOperation {
         var op = initial
-        try {
-            repeat(attempts) {
-                val task = connection.observeTask(requireNotNull(op.taskRef))
-                when (task.status) {
-                    "failure", "cancelled" -> return save(op.copy(phase = PowerPhase.FAILED,
-                        message = "Server task ${task.status}${task.errorCode?.let { " ($it)" }.orEmpty()}. Refresh the VM before another action."), changed)
-                    "success" -> {
-                        if (op.phase != PowerPhase.VERIFYING) op = save(op.copy(phase = PowerPhase.VERIFYING, message = "Task finished. Verifying VM state…"), changed)
-                        val current = connection.details(op.authority, op.vmUuid)
-                        if (PowerRules.verified(op, current)) return save(op.copy(phase = PowerPhase.SUCCEEDED,
-                            message = verifiedMessage(op, current)), changed)
+        var shown: Double? = null
+        val done = poll({ op }, changed) {
+            val task = connection.observeTask(requireNotNull(op.taskRef))
+            when (task.status) {
+                "failure", "cancelled" -> save(op.copy(phase = PowerPhase.FAILED,
+                    message = "Server task ${task.status}${task.errorCode?.let { " ($it)" }.orEmpty()}. Refresh the VM before another action."), changed)
+                "success" -> {
+                    if (op.phase != PowerPhase.VERIFYING) op = save(op.copy(phase = PowerPhase.VERIFYING, message = "Task finished. Verifying VM state…"), changed)
+                    // The light read carries every field the proof uses. A VM deleted meanwhile cannot be verified.
+                    val current = connection.vmState(op.authority, op.vmUuid)
+                    when {
+                        current == null -> save(op.copy(phase = PowerPhase.UNKNOWN, message = VM_GONE), changed)
+                        PowerRules.verified(op, current) -> save(op.copy(phase = PowerPhase.SUCCEEDED, message = verifiedMessage(op, current)), changed)
+                        else -> null
                     }
-                    "pending", "cancelling" -> if (op.phase != PowerPhase.TRACKING) op = save(op.copy(phase = PowerPhase.TRACKING, message = "Waiting for server task…"), changed)
-                    else -> throw IllegalStateException("Unknown task state")
                 }
-                wait()
+                "pending", "cancelling" -> {
+                    if (op.phase != PowerPhase.TRACKING) op = save(op.copy(phase = PowerPhase.TRACKING, message = "Waiting for server task…"), changed)
+                    shown = showProgress(op, task, shown, changed)
+                    null
+                }
+                else -> throw IllegalStateException("Unknown task state")
             }
-        } catch (error: Exception) { if (error is CancellationException) throw error }
-        return save(op.copy(phase = PowerPhase.UNKNOWN, message = "Still unverified. Check status to continue observing; the action will not be resent."), changed)
+        }
+        return done ?: save(op.copy(phase = PowerPhase.UNKNOWN, message = "Still unverified. Check status to continue observing; the action will not be resent."), changed)
     }
     // --- B2 storage/host ---
     /**
@@ -433,7 +634,7 @@ class PowerService(
                 targetAction = action, targetUuid = current.uuid, targetName = current.name.ifBlank { current.uuid },
                 argumentUuid = chosenIso?.uuid,
                 argumentName = chosenIso?.name ?: confirmation.snapshotName.takeIf { action == TargetAction.SNAPSHOT_TAKE },
-                marker = TargetRules.marker(action, current),
+                marker = TargetRules.marker(action, current, confirmation.snapshotName.takeIf { action == TargetAction.SNAPSHOT_TAKE }), // inventory scale
                 steps = if (action == TargetAction.SNAPSHOT_DELETE) TargetRules.deletePlan(current as SnapshotTarget) else null)
             op = save(op, changed)
             // Multi-step: each sub-step has its own write-ahead record and is never re-run blindly.
@@ -465,25 +666,27 @@ class PowerService(
     private suspend fun trackTarget(connection: PowerConnection, initial: PowerOperation, changed: suspend (PowerOperation) -> Unit): PowerOperation {
         var op = initial
         val action = requireNotNull(op.targetAction)
-        try {
-            repeat(attempts) {
-                val task = connection.observeTask(requireNotNull(op.taskRef))
-                when (task.status) {
-                    "failure", "cancelled" -> return save(op.copy(phase = PowerPhase.FAILED,
-                        message = "Server task ${task.status}${task.errorCode?.let { " ($it)" }.orEmpty()}. Refresh before another action."), changed)
-                    "success" -> {
-                        if (op.phase != PowerPhase.VERIFYING) op = save(op.copy(phase = PowerPhase.VERIFYING, message = "Task finished. Verifying server state…"), changed)
-                        val proof = connection.target(op.authority, action.proofKind, TargetRules.proofUuid(op))
-                        if (TargetRules.verified(op, proof)) return save(op.copy(phase = PowerPhase.SUCCEEDED, message = TargetRules.verifiedMessage(op, proof),
-                            argumentUuid = TargetRules.newSnapshot(op, proof)?.uuid ?: op.argumentUuid), changed)
-                    }
-                    "pending", "cancelling" -> if (op.phase != PowerPhase.TRACKING) op = save(op.copy(phase = PowerPhase.TRACKING, message = "Waiting for server task…"), changed)
-                    else -> throw IllegalStateException("Unknown task state")
+        var shown: Double? = null
+        val done = poll({ op }, changed) {
+            val task = connection.observeTask(requireNotNull(op.taskRef))
+            when (task.status) {
+                "failure", "cancelled" -> save(op.copy(phase = PowerPhase.FAILED,
+                    message = "Server task ${task.status}${task.errorCode?.let { " ($it)" }.orEmpty()}. Refresh before another action."), changed)
+                "success" -> {
+                    if (op.phase != PowerPhase.VERIFYING) op = save(op.copy(phase = PowerPhase.VERIFYING, message = "Task finished. Verifying server state…"), changed)
+                    val proof = connection.target(op.authority, action.proofKind, TargetRules.proofUuid(op))
+                    if (TargetRules.verified(op, proof)) save(op.copy(phase = PowerPhase.SUCCEEDED, message = TargetRules.verifiedMessage(op, proof),
+                        argumentUuid = TargetRules.newSnapshot(op, proof)?.uuid ?: op.argumentUuid), changed) else null
                 }
-                wait()
+                "pending", "cancelling" -> {
+                    if (op.phase != PowerPhase.TRACKING) op = save(op.copy(phase = PowerPhase.TRACKING, message = "Waiting for server task…"), changed)
+                    shown = showProgress(op, task, shown, changed)
+                    null
+                }
+                else -> throw IllegalStateException("Unknown task state")
             }
-        } catch (error: Exception) { if (error is CancellationException) throw error }
-        return save(op.copy(phase = PowerPhase.UNKNOWN, message = TargetRules.unverifiedMessage(op)), changed)
+        }
+        return done ?: save(op.copy(phase = PowerPhase.UNKNOWN, message = TargetRules.unverifiedMessage(op)), changed)
     }
 
     /** Runs the recorded sub-steps in order. Each is journaled SUBMITTING before it is sent; any doubt stops the run. */
@@ -492,6 +695,8 @@ class PowerService(
         for (index in op.steps.orEmpty().indices) {
             val step = op.steps.orEmpty()[index]
             if (step.state != StepState.PENDING) continue
+            // Stop watching: after a stop nothing new is sent; the record recovers like a delete interrupted by a restart.
+            if (currentCoroutineContext()[TrackingWatch]?.stopRequested == true && op.taskUuid != null) stopWatching(op.id, changed)
             // Read only: an object that is already gone is recorded and skipped; nothing is sent for it.
             val gone = try { connection.absent(op.authority, step) } catch (error: Exception) {
                 if (error is CancellationException) throw error
@@ -523,24 +728,24 @@ class PowerService(
     /** Observes one sent sub-step: done only after task success and a read showing its object gone. */
     private suspend fun observeStep(connection: PowerConnection, initial: PowerOperation, index: Int, changed: suspend (PowerOperation) -> Unit): PowerOperation {
         var op = initial
-        try {
-            repeat(attempts) {
-                val step = op.steps.orEmpty()[index]
-                val task = connection.observeTask(requireNotNull(step.taskRef))
-                when (task.status) {
-                    "failure", "cancelled" -> return op.withStep(index) { it.copy(state = StepState.FAILED, code = task.errorCode ?: task.status.uppercase()) }
-                    "success" -> {
-                        if (op.phase != PowerPhase.VERIFYING) op = save(op.copy(phase = PowerPhase.VERIFYING, message = "Task finished. Verifying “${step.name}” is gone…"), changed)
-                        if (connection.absent(op.authority, step)) return save(op.withStep(index) { it.copy(state = StepState.DONE) }
-                            .copy(message = "Destroyed “${step.name}”."), changed)
-                    }
-                    "pending", "cancelling" -> if (op.phase != PowerPhase.TRACKING) op = save(op.copy(phase = PowerPhase.TRACKING, message = "Waiting for server task…"), changed)
-                    else -> throw IllegalStateException("Unknown task state")
+        val done = poll({ op }, changed) {
+            val step = op.steps.orEmpty()[index]
+            val task = connection.observeTask(requireNotNull(step.taskRef))
+            when (task.status) {
+                "failure", "cancelled" -> op.withStep(index) { it.copy(state = StepState.FAILED, code = task.errorCode ?: task.status.uppercase()) }
+                "success" -> {
+                    if (op.phase != PowerPhase.VERIFYING) op = save(op.copy(phase = PowerPhase.VERIFYING, message = "Task finished. Verifying “${step.name}” is gone…"), changed)
+                    if (connection.absent(op.authority, step)) save(op.withStep(index) { it.copy(state = StepState.DONE) }
+                        .copy(message = "Destroyed “${step.name}”."), changed) else null
                 }
-                wait()
+                "pending", "cancelling" -> {
+                    if (op.phase != PowerPhase.TRACKING) op = save(op.copy(phase = PowerPhase.TRACKING, message = "Waiting for server task…"), changed)
+                    null
+                }
+                else -> throw IllegalStateException("Unknown task state")
             }
-        } catch (error: Exception) { if (error is CancellationException) throw error }
-        return op.withStep(index) { it.copy(state = StepState.UNKNOWN) }
+        }
+        return done ?: op.withStep(index) { it.copy(state = StepState.UNKNOWN) }
     }
 
     private suspend fun verifySteps(connection: PowerConnection, op: PowerOperation, changed: suspend (PowerOperation) -> Unit): PowerOperation {
@@ -674,4 +879,157 @@ class PowerService(
         require(!current.busy) { "The ${current.kind.label} still has an active operation. Check status later." }
     }
     // --- end B2 storage/host ---
+    // --- VM settings ---
+    /**
+     * Sends one confirmed settings edit: the setter calls in order, each journaled SUBMITTING (with its send time)
+     * before its single send, each proven by a read-back of the requested value before the next one is sent.
+     * See METEOR-VM-SETTINGS.md. Same lock and "one unresolved operation blocks every write" rule as every write.
+     */
+    suspend fun executeSettings(profile: Profile, confirmation: SettingsConfirmation, changed: suspend (PowerOperation) -> Unit = {}): PowerOperation = processMutex.withLock {
+        require(store.load().none { it.unresolved }) { "Resolve the pending operation before sending another." }
+        backend.powerConnection(profile) {
+            val current = settings(confirmation.settings.authority, confirmation.settings.uuid) ?: throw IllegalArgumentException("This VM no longer exists.")
+            SettingsRules.confirm(profile, confirmation, current, clock())
+            var op = PowerOperation(UUID.randomUUID().toString(), profile.id, profile.origin(), current.authority, current.uuid,
+                current.name.ifBlank { current.uuid }, PowerAction.SETTINGS, null, PowerPhase.PREPARED, clock(), clock(),
+                message = "Prepared. Nothing sent yet.", settings = confirmation.steps)
+            op = save(op, changed)
+            runSettings(this, op, changed)
+        }
+    }
+
+    private suspend fun runSettings(connection: PowerConnection, initial: PowerOperation, changed: suspend (PowerOperation) -> Unit): PowerOperation {
+        var op = initial
+        for (index in op.settings.orEmpty().indices) {
+            val step = op.settings.orEmpty()[index]
+            if (step.state != SettingState.PENDING) continue
+            // A cancelled run sends nothing more; the record says what was and was not sent.
+            if (!currentCoroutineContext().isActive) {
+                withContext(NonCancellable) { finishSettings(op, changed, "Stopped before sending.") }
+                currentCoroutineContext().ensureActive()
+            }
+            // Read just before the send: the field must still hold the value the confirmation showed.
+            val fresh = try { connection.settings(op.authority, op.vmUuid) } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                return finishSettings(op, changed, "Could not read the VM again just before sending.")
+            } ?: return finishSettings(op, changed, "The VM no longer exists.")
+            if (SettingsRules.value(step.kind, step.argument, fresh) != step.before)
+                return finishSettings(op, changed, "${step.kind.label} changed on the server before it was sent.")
+            if (fresh.busy) return finishSettings(op, changed, "Another VM operation started.")
+            // Write-ahead barrier: from here a lost reply is uncertain and is never resent.
+            op = save(SettingsRules.withSetting(op, index) { it.copy(state = SettingState.SUBMITTING, sentAt = clock()) }
+                .copy(phase = PowerPhase.SUBMITTING, message = "Sending once: ${SettingsRules.change(step)}…"), changed)
+            val failure = try { connection.submitSetting(op.authority, op.vmUuid, op.settings.orEmpty()[index]); null } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                error
+            }
+            if (failure == null) {
+                op = save(op.copy(phase = PowerPhase.VERIFYING, message = "Sent. Reading ${step.kind.label.lowercase()} back…"), changed)
+                val observed = settle(connection, op, step)
+                val state = when (observed) {
+                    step.requested -> SettingState.DONE
+                    null, step.before -> SettingState.UNKNOWN // accepted, yet unreadable or still old: never assumed either way
+                    else -> SettingState.OVERRIDDEN
+                }
+                op = save(SettingsRules.withSetting(op, index) { it.copy(state = state, observed = observed) }
+                    .copy(message = if (state == SettingState.DONE) "Verified: ${SettingsRules.change(step)}." else op.message), changed)
+                if (state == SettingState.DONE) continue
+                return finishSettings(op, changed, if (state == SettingState.OVERRIDDEN)
+                    "The server accepted ${step.kind.label.lowercase()}, but it now reads ${SettingsRules.display(step.kind, observed)}."
+                    else "The server accepted ${step.kind.label.lowercase()}, but the read-back does not show it.")
+            }
+            val code = (failure as? RpcFailure)?.code
+            var observed: String? = null
+            val (state, note) = when (SettingsRules.failure(failure)) {
+                SettingFailure.NOT_SENT -> {
+                    // Read-only checks failed before the call was built: nothing reached the server.
+                    op = SettingsRules.withSetting(op, index) { it.copy(state = SettingState.PENDING, sentAt = null) }
+                    return finishSettings(op, changed, "Not sent: ${failure.message}")
+                }
+                SettingFailure.REJECTED -> {
+                    observed = readBack(connection, op, step)
+                    // A read-back that contradicts a definite rejection keeps the step uncertain.
+                    (if (observed != null && observed != step.before) SettingState.UNKNOWN else SettingState.REJECTED) to null
+                }
+                SettingFailure.AMBIGUOUS -> {
+                    observed = readBack(connection, op, step)
+                    when (observed) {
+                        step.before -> SettingState.NOT_APPLIED to "The server reported an error ($code); the value did not change."
+                        step.requested -> SettingState.DONE to "The server reported an error ($code), but the value now reads as requested."
+                        else -> SettingState.UNKNOWN to "The server reported an error ($code) that does not say whether anything changed."
+                    }
+                }
+                SettingFailure.LOST -> {
+                    observed = readBack(connection, op, step)
+                    if (observed == step.requested) SettingState.DONE to "The reply was lost, but the value now reads as requested."
+                    else SettingState.UNKNOWN to "The reply was lost. Meteor cannot tell yet whether it was applied."
+                }
+            }
+            op = SettingsRules.withSetting(op, index) { it.copy(state = state, code = code, observed = observed) }
+            // Any answer other than a clean reply stops the run: the remaining steps are never sent automatically.
+            return finishSettings(op, changed, note)
+        }
+        return finishSettings(op, changed, null)
+    }
+    private suspend fun readBack(connection: PowerConnection, op: PowerOperation, step: SettingStep): String? =
+        try { connection.settings(op.authority, op.vmUuid)?.let { SettingsRules.value(step.kind, step.argument, it) } } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            null
+        }
+    /** After a clean reply: a few read-backs until the requested value shows. Returns the last value read, or null. */
+    private suspend fun settle(connection: PowerConnection, op: PowerOperation, step: SettingStep): String? {
+        var last: String? = null
+        for (attempt in 0 until SettingsRules.SETTLE_READS) {
+            last = readBack(connection, op, step)
+            if (last == step.requested) return last
+            if (attempt < SettingsRules.SETTLE_READS - 1) wait(SettingsRules.SETTLE_PAUSE_MILLIS)
+        }
+        return last
+    }
+
+    /** Closes or parks a settings record from its steps. Only every step DONE is success; any doubt stays UNKNOWN. */
+    private suspend fun finishSettings(op: PowerOperation, changed: suspend (PowerOperation) -> Unit, note: String?): PowerOperation {
+        val steps = op.settings.orEmpty()
+        val prefix = note?.let { "$it " }.orEmpty()
+        val summary = SettingsRules.summary(steps)
+        val uncertain = steps.any { it.state == SettingState.SUBMITTING || it.state == SettingState.UNKNOWN }
+        return when {
+            steps.isNotEmpty() && steps.all { it.state == SettingState.DONE } ->
+                save(op.copy(phase = PowerPhase.SUCCEEDED, message = "${prefix}Saved and verified. $summary"), changed)
+            uncertain -> save(op.copy(phase = PowerPhase.UNKNOWN, message = "$prefix$summary Check status; nothing will be resent."), changed)
+            steps.none { it.state != SettingState.PENDING } -> save(op.copy(phase = PowerPhase.FAILED, message = "${prefix}Nothing was sent. $summary"), changed)
+            else -> save(op.copy(phase = PowerPhase.FAILED, message = "$prefix$summary" +
+                (if (steps.any { it.state == SettingState.PENDING }) " Edit again to send what was not sent." else "")), changed)
+        }
+    }
+
+    /**
+     * Check status for a settings record: reads the uncertain step's field. Requested value: DONE. Old value: NOT_APPLIED
+     * only when the read is at least [SettingsRules.QUIET_MILLIS] after the journaled send time and the VM has no current
+     * operation; otherwise it stays UNKNOWN. A third value stays UNKNOWN for manual review. Never sends anything.
+     */
+    private suspend fun reconcileSettings(profile: Profile, persisted: PowerOperation, changed: suspend (PowerOperation) -> Unit): PowerOperation {
+        require(persisted.profileId == profile.id && persisted.origin == profile.origin()) { "Original connection required for recovery." }
+        val steps = persisted.settings.orEmpty()
+        val index = steps.indexOfFirst { it.state == SettingState.SUBMITTING || it.state == SettingState.UNKNOWN }
+        if (index < 0) {
+            if (steps.all { it.state == SettingState.PENDING }) return save(persisted.copy(phase = PowerPhase.FAILED,
+                message = "App stopped before submission. No request was sent. ${SettingsRules.summary(steps)}"), changed)
+            return finishSettings(persisted, changed, null)
+        }
+        val step = steps[index]
+        return try {
+            backend.powerConnection(profile) {
+                val current = settings(persisted.authority, persisted.vmUuid)
+                    ?: return@powerConnection save(persisted.copy(phase = PowerPhase.UNKNOWN, message = VM_GONE), changed)
+                val observed = SettingsRules.value(step.kind, step.argument, current)
+                val (state, note) = SettingsRules.reconcile(step, observed, current.busy, clock())
+                finishSettings(save(SettingsRules.withSetting(persisted, index) { it.copy(state = state, observed = observed) }, changed), changed, note)
+            }
+        } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            save(persisted.copy(phase = PowerPhase.UNKNOWN, message = "Could not reconcile securely. Keep this operation pending and check again."), changed)
+        }
+    }
+    // --- end VM settings ---
 }

@@ -57,12 +57,8 @@ import java.util.Date
         item { PageTitle("Your universe", state.selectedProfile?.label ?: "A clear view of every spark.") }
         if (state.profiles.size >= 2) item { AllPoolsCard(state) } // B3 background/summary
         if (inventory == null) item {
-            Panel {
-                SpaceIcon("orbit", Modifier.size(52.dp))
-                Text("Bring your first server into orbit", style = MaterialTheme.typography.titleLarge)
-                Text("Connect directly to XCP-ng to see hosts, virtual machines, and storage.", style = MaterialTheme.typography.bodyMedium)
-                Button(onClick = connect) { Text("Add connection") }
-            }
+            // The first-run invitation is only for a person with no saved connection (OverviewEmptyState).
+            OverviewEmptyState.of(state)?.let { OverviewEmptyPanel(it, connect) }
         } else {
             val fresh = state.connected && now - inventory.observedAtMillis in 0..state.inventoryFreshMillis /* A4: longer while live events are healthy */
             item {
@@ -77,6 +73,10 @@ import java.util.Date
                     Text("Updated ${DateFormat.getTimeInstance(DateFormat.SHORT).format(Date(inventory.observedAtMillis))}",
                         style = MaterialTheme.typography.labelMedium, color = MaterialTheme.colorScheme.onSurfaceVariant)
                 }
+            }
+            // inventory scale: what could not be loaded is said, never hidden
+            if (inventory.notLoaded.isNotEmpty()) item {
+                inventory.notLoaded.forEach { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error) }
             }
             item {
                 Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
@@ -113,6 +113,10 @@ import java.util.Date
                         }
                     }
                     TextButton(onClick = { hostDetails(host.uuid) }) { Text("Host details") }
+                    // B1 console: opens view-only; the host details say why it is unavailable when it is.
+                    LocalMeteorModel.current?.let { model ->
+                        OutlinedButton(onClick = { model.openHostConsole(host) }, enabled = state.connected && host.online) { Text("Host console") }
+                    }
                     OutlinedButton(onClick = { metrics(MetricTarget(inventory.authority, host.uuid, MetricKind.HOST, host.name)) },
                         enabled = state.connected && host.online) { Text("Host performance") }
                 }

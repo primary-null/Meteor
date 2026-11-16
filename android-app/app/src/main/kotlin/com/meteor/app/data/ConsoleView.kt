@@ -29,7 +29,20 @@ data class ViewTransform(
     companion object {
         const val MAX_ZOOM = 8f
         private const val FIT_SNAP = 0.03f
+
+        /**
+         * Restores what [toSaved] wrote. The viewport and the guest size are not saved: the screen supplies them again
+         * after a rotation, which also re-clamps the pan to the new view. Unusable data gives the fitted view.
+         */
+        fun fromSaved(values: List<Float>): ViewTransform {
+            if (values.size != 4 || values.any { !it.isFinite() }) return ViewTransform()
+            val (fit, zoom, panX, panY) = values
+            return ViewTransform(fit = fit != 0f, zoom = zoom.coerceIn(0.05f, MAX_ZOOM), panX = panX, panY = panY)
+        }
     }
+
+    /** The user's zoom and pan, for state that survives rotation. */
+    fun toSaved(): List<Float> = listOf(if (fit) 1f else 0f, zoom, panX, panY)
 
     val ready: Boolean get() = viewWidth > 0f && viewHeight > 0f && frameWidth > 0 && frameHeight > 0
     val fitScale: Float get() = if (ready) min(viewWidth / frameWidth, viewHeight / frameHeight) else 1f

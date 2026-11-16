@@ -26,6 +26,9 @@ object JournalCodec {
     private val knownPhases = PowerPhase.entries.associateBy { it.name }
 
     fun decode(fields: Map<String, Any?>): PowerOperation {
+        // --- VM settings ---
+        if (fields["action"] == SETTINGS_ACTION) return decodeSettings(fields)
+        // --- end VM settings ---
         // --- B2 storage/host ---
         targetActions[fields["action"] as? String]?.let { return decodeTarget(fields, it) }
         // --- end B2 storage/host ---
@@ -60,7 +63,9 @@ object JournalCodec {
     fun encode(operation: PowerOperation): Map<String, Any?> {
         operation.foreign?.let { raw ->
             val review = operation.manualResolution
-            if (review == null || raw.containsKey("manualResolution")) return raw
+            // Journaled operation hardening: a raw resolution this version did not accept as a closure must not hide a new
+            // closure, or the record would be locked again after the next load. An accepted one is written back unchanged.
+            if (review == null || raw["manualResolution"]?.let { runCatching { resolution(it) }.getOrNull() } == review) return raw
             return raw + mapOf("phase" to operation.phase.name, "updatedAt" to operation.updatedAt,
                 "message" to operation.message, "manualResolution" to resolutionFields(review))
         }
@@ -81,6 +86,12 @@ object JournalCodec {
             operation.steps?.let { steps -> item["steps"] = steps.map(::stepFields) }
         }
         // --- end B2 storage/host ---
+        // --- VM settings --- the `action` key holds VM_SETTINGS; `settings` is the only new key.
+        operation.settings?.let { steps ->
+            item["action"] = SETTINGS_ACTION
+            item["settings"] = steps.map(::settingFields)
+        }
+        // --- end VM settings ---
         operation.manualResolution?.let { item["manualResolution"] = resolutionFields(it) }
         return item
     }
@@ -118,6 +129,48 @@ object JournalCodec {
     private fun stepFields(step: OperationStep) = linkedMapOf<String, Any?>("kind" to step.kind.name, "uuid" to step.uuid, "name" to step.name,
         "state" to step.state.name, "taskRef" to step.taskRef.orEmpty(), "taskUuid" to step.taskUuid.orEmpty(), "code" to step.code.orEmpty())
     // --- end B2 storage/host ---
+
+    // --- VM settings ---
+    /**
+     * A settings record: `action` "VM_SETTINGS" (no PowerAction or TargetAction has that name, so 1.10 keeps the record
+     * as foreign: locked, never observed or resent, closable through its VM review because `vm` is set) and `settings`,
+     * a list of steps with `kind`, `before`, `requested`, `state` and the optional `argument`, `observed`, `code` and
+     * `sentAt`. An unknown phase, step kind or step state, a missing `vm` or a missing list keeps the record foreign here
+     * too. A malformed step of a known shape fails the whole load, like every other known record.
+     */
+    const val SETTINGS_ACTION = "VM_SETTINGS"
+    private fun decodeSettings(fields: Map<String, Any?>): PowerOperation {
+        val phase = knownPhases[fields["phase"] as? String]
+        val raw = fields["settings"] as? List<*>
+        val known = raw != null && raw.isNotEmpty() && raw.all { item ->
+            val step = item as? Map<*, *>
+            step != null && SettingKind.entries.any { it.name == step["kind"] } && SettingState.entries.any { it.name == step["state"] }
+        }
+        if (phase == null || !known || (fields["vm"] as? String).isNullOrBlank()) return foreign(fields, null, phase)
+        return PowerOperation(
+            text(fields, "id"), text(fields, "profile"), text(fields, "origin"), text(fields, "authority"),
+            text(fields, "vm"), text(fields, "name"), PowerAction.SETTINGS, optional(fields, "beforeBoot"), phase,
+            number(fields, "createdAt"), number(fields, "updatedAt"), optional(fields, "taskRef"), optional(fields, "taskUuid"),
+            text(fields, "message"), fields["manualResolution"]?.let(::resolution), settings = raw!!.map(::setting))
+    }
+    private fun setting(value: Any?): SettingStep {
+        val fields = (value as Map<*, *>).entries.associate { it.key.toString() to it.value }
+        fun exact(key: String): String = fields[key] as? String ?: throw IllegalArgumentException("Journal setting field $key is missing.")
+        return SettingStep(SettingKind.valueOf(exact("kind")), fields["argument"]?.let { it as? String ?: throw IllegalArgumentException("Invalid journal setting.") },
+            exact("before"), exact("requested"), SettingState.valueOf(exact("state")),
+            fields["observed"]?.let { it as? String ?: throw IllegalArgumentException("Invalid journal setting.") },
+            fields["code"]?.let { it as? String ?: throw IllegalArgumentException("Invalid journal setting.") },
+            fields["sentAt"]?.let { (it as? Number)?.toLong() ?: throw IllegalArgumentException("Invalid journal setting.") })
+    }
+    /** Absent optional values are omitted, so an empty observed value (an empty description) stays distinct from none. */
+    private fun settingFields(step: SettingStep) = linkedMapOf<String, Any?>("kind" to step.kind.name).apply {
+        step.argument?.let { put("argument", it) }
+        put("before", step.before); put("requested", step.requested); put("state", step.state.name)
+        step.observed?.let { put("observed", it) }
+        step.code?.let { put("code", it) }
+        step.sentAt?.let { put("sentAt", it) }
+    }
+    // --- end VM settings ---
 
     private fun resolutionFields(review: ManualResolution) = linkedMapOf<String, Any?>("reviewedAt" to review.reviewedAt,
         "origin" to review.origin, "power" to review.power, "bootTime" to review.bootTime.orEmpty())

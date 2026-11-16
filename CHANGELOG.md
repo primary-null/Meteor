@@ -1,5 +1,26 @@
 # Change history
 
+## 1.11 — Android delivery 20
+
+Minor increment: editing a VM's settings and a host console, on top of a round of fixes that came from a code audit and from the first recordings of a real XCP-ng 8.3 host. Journal and profile documents keep version 1 and gain only optional keys, so 1.10 data loads unchanged; a 1.10 build that meets a settings record keeps it locked and can close it through its existing review. Offline checks and recordings do not imply live-server acceptance of every operation.
+
+- Record a real XCP-ng 8.3 host read-only and replay the sanitized recordings through the app's parsers and decoders (`app/src/test/resources/live-xcpng-8.3`). The three corrections below could not be seen against a simulated pool.
+- Live performance could not load at all (`inf` in data-source lists) and would have shown zero (current values come from `query_data_source`). Read real values from a fixed set of enabled sources, with zero-based scales and one number format without exponents.
+- History charts were answered from a coarser archive than they asked for. Request the right start, keep earlier rows across incremental reads, and stop showing the aggregate NIC and CD drives as cards.
+- The inventory read failed above roughly 180 VMs because every template and snapshot was fetched. Read one filtered, streamed VM list, so pools of thousands of VMs load; size the reader's limits from measured record costs; carry true totals on bounded lists instead of cutting them silently; and prove a new snapshot against the complete list.
+- Add VM settings editing through a journaled synchronous write with per-step read-back proof: name, description, tags, vCPUs, memory, start with the host, boot order and HA restart priority. A lost reply is never resent.
+- Add the host console: an XCP-ng host's own screen, opened from the host's details, view-only until one confirmation that names the host. Ctrl+Alt+Del is never sent to a host. The RFB client decodes any true-colour pixel format.
+- Console: tapping a running VM opens its console directly; held keys repeat; the on-screen keyboard keeps its symbol layout between characters; taps outside the picture are ignored; a long paste waits for a slow link; a mouse maps to buttons, wheel and hover; a lost console reconnects automatically with a bounded backoff.
+- An operation whose VM was deleted, or whose record this build cannot interpret, can be closed after manual review instead of locking writes. A failure before the write call is recorded as not sent, not as uncertain.
+- Watch a submitted operation for as long as its kind realistically takes and tolerate transient observation failures. The app stays usable for reading meanwhile; new writes stay locked. Add Stop watching and task progress to the operation card.
+- Back off automatic reconnects and stop them after rejected credentials, a changed certificate or a pool-member answer until the user acts. Watch the default network and show an offline state instead of a server error.
+- Reuse one XAPI session per connected profile, with one re-login for reads after `SESSION_INVALID`, instead of a login per call. Writes are never repeated and never use a kept-alive connection.
+- Background alert checks compare alerts in the server's time, record and show each profile's last check and outcome, retry a transient failure sooner, post one notice when checks keep failing, and clear notifications for alerts seen or dismissed in the app. The battery-not-low constraint is removed.
+- An unreadable saved-connection store is explained on Connect with Try again and Start over; Start over sets the file aside, creates a fresh key and never touches the operation journal.
+- After a settings save the editor restarts from the values read back; a long description's confirmation shows the part that changed; Overview no longer shows the first-run card beside a saved connection.
+- Run on a foldable phone against the real host: inventory, the VM console (typing, special keys, zoom, view-only, background and rotation), live and historical performance, alerts, a settings edit and its restore, and the host console view-only. Snapshots, migration, host maintenance, storage repair and input to a host console were not exercised there.
+- Checks: source guard, Python reference tests, debug build, lint, instrumentation test compilation and 1138 JVM tests, including loopback pinned-HTTPS XAPI fixtures and the recorded-host replays.
+
 ## 1.10 — Android delivery 17
 
 Minor increment: useful new capabilities on the existing direct-XAPI product. Journal and profile documents keep version 1 and gain only optional keys, so 1.9 data loads unchanged; an older build that meets a new operation kind keeps it locked instead of discarding it. Offline checks do not imply live-server acceptance. No Xen Orchestra adapter in this release.

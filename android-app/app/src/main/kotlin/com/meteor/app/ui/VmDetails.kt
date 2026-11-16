@@ -1,6 +1,8 @@
 package com.meteor.app.ui
 
+import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.selection.selectable
@@ -14,6 +16,7 @@ import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
+import com.meteor.app.ControlGates
 import com.meteor.app.MeteorState
 import com.meteor.app.MeteorViewModel
 import com.meteor.app.data.*
@@ -35,19 +38,33 @@ import java.util.Date
 /** VM details as a titled pane. Used directly as the Fleet detail pane and inside [VmDetailsDialog]. */
 @Composable internal fun VmDetailsPane(guest: Guest, state: MeteorState, model: MeteorViewModel, performance: () -> Unit, close: () -> Unit,
     modifier: Modifier = Modifier) {
-    DetailPane(guest.name, close, modifier) { VmDetailsContent(guest, state, model, performance) }
+    // --- VM settings --- "Edit settings" replaces the details in this same pane or full-screen dialog; Back returns to them.
+    var editing by rememberSaveable(guest.uuid) { mutableStateOf(false) }
+    val detail = state.details?.takeIf { it.uuid == guest.uuid && it.authority == guest.poolUuid }
+    if (editing && detail != null) {
+        BackHandler { editing = false }
+        DetailPane("Edit ${guest.name}", { editing = false }, modifier) { VmSettingsEditor(detail, state, model) }
+        return
+    }
+    // --- end VM settings ---
+    DetailPane(guest.name, close, modifier) {
+        // --- VM settings ---
+        OutlinedButton(onClick = { editing = true }, enabled = detail != null && state.connected && !ControlGates.operationExclusive(state)) { Text("Edit settings") }
+        // --- end VM settings ---
+        VmDetailsContent(guest, state, model, performance)
+    }
 }
 
 @Composable private fun ColumnScope.VmDetailsContent(guest: Guest, state: MeteorState, model: MeteorViewModel, performance: () -> Unit) {
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri -> if (uri != null) model.importIcon(guest, uri) }
     var showAddresses by remember(guest.uuid) { mutableStateOf(false) }
     val detail = state.details?.takeIf { it.uuid == guest.uuid && it.authority == guest.poolUuid }
-    // B1 console: opens the full-screen console destination (this view closes while it is open).
-    OutlinedButton(onClick = { if (detail != null) model.openConsole(guest, detail) },
-        enabled = detail != null && !state.detailsBusy && state.connected && state.selectedProfile != null) { Text("Open console") }
+    // B1 console: opens the full-screen console destination (this view closes while it is open); Back returns here.
+    OutlinedButton(onClick = { model.openConsole(guest, fromDetails = true) },
+        enabled = (detail?.power ?: guest.power) == "Running" && state.connected && state.selectedProfile != null) { Text("Open console") }
     if (state.detailsBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
     Text("${detail?.power ?: guest.power} · ${detail?.vcpus ?: guest.vcpus} vCPU · ${bytes(detail?.memoryBytes ?: guest.memoryBytes)}")
-    OutlinedButton(onClick = performance, enabled = state.connected && !state.profileBusy && !state.operationBusy) { Text("VM performance") }
+    OutlinedButton(onClick = performance, enabled = state.connected && !state.profileBusy && !ControlGates.operationExclusive(state)) { Text("VM performance") }
     if (detail != null) {
         Text("Host: ${detail.host ?: if (detail.power == "Halted") "Unassigned" else "Unknown"}", style = MaterialTheme.typography.bodySmall)
         Text(if (detail.guestToolsLive) "Guest tools reporting${detail.os?.let { " · $it" }.orEmpty()}" else "Guest tools not reporting", style = MaterialTheme.typography.bodySmall)
@@ -70,7 +87,7 @@ import java.util.Date
     }
     if (detail == null && !state.detailsBusy) Text("Details are unavailable. Load them again when connected.", style = MaterialTheme.typography.bodySmall)
     OutlinedButton(onClick = { model.openDetails(guest) },
-        enabled = state.connected && !state.loading && !state.detailsBusy && !state.operationBusy) {
+        enabled = state.connected && !state.loading && !state.detailsBusy && !ControlGates.operationExclusive(state)) {
         Text(if (detail == null) "Load details" else "Refresh details")
     }
     Text("VM icon", fontWeight = FontWeight.Medium)

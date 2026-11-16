@@ -42,6 +42,16 @@ object ConnectionProfiles {
         return ProfileDocument(profiles, selectedId)
     }
 
+    // --- vault recovery ---
+    /**
+     * True when a review that started from the Add form lands on a saved connection with the same server and username: trusting it
+     * replaces that connection's name and password (it keeps its identity and certificate pin). The review says so. An edit, and a
+     * pool-master follow (which also rewrites an existing profile), are not "adds".
+     */
+    fun replacesOnAdd(previous: Profile?, editingProfileId: String?, followedFrom: String?) =
+        previous != null && followedFrom == null && editingProfileId != previous.id
+    // --- end vault recovery ---
+
     fun forget(document: ProfileDocument, id: String, operations: List<PowerOperation>): ProfileDocument {
         require(document.profiles.any { it.id == id }) { "This connection is no longer available." }
         require(operations.none { it.profileId == id && it.unresolved }) {

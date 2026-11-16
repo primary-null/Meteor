@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><methodCall><methodName>VM.query_data_source</methodName><params><param><value><string>OpaqueRef:f0770f83-fae5-4e8b-9eab-a67b0e02c7dc</string></value></param><param><value><string>OpaqueRef:24851764-ff8d-46bc-8802-64b0488adae7</string></value></param><param><value><string>no_such_source</string></value></param></params></methodCall>

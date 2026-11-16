@@ -11,6 +11,7 @@ import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.meteor.app.ControlGates
 import com.meteor.app.MeteorState
 import com.meteor.app.MeteorViewModel
 import com.meteor.app.PoolSummaryLine
@@ -29,8 +30,8 @@ class PoolsActions(
 
 class PoolsUi(val state: MeteorState, val actions: PoolsActions) {
     /** The same gate as the Connections screen's Connect button. */
-    val canSwitch get() = !state.loading && !state.profileBusy && !state.operationBusy && state.pendingTrust == null
-    val canCheckUpdates get() = state.connected && !state.loading && !state.profileBusy && !state.operationBusy
+    val canSwitch get() = !state.loading && !state.profileBusy && !ControlGates.operationExclusive(state) && state.pendingTrust == null
+    val canCheckUpdates get() = state.connected && !state.loading && !state.profileBusy && !ControlGates.operationExclusive(state)
 }
 val LocalPoolsUi = compositionLocalOf<PoolsUi?> { null }
 

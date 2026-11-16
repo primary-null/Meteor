@@ -45,7 +45,9 @@ import com.meteor.app.storageView
         if (current.residentVms.isNotEmpty()) Text("Running here: ${current.residentVms.joinToString()}", style = MaterialTheme.typography.bodySmall)
         current.blockers?.takeIf { it.isNotEmpty() }?.let { blockers ->
             Text("Prevent evacuation:", style = MaterialTheme.typography.labelLarge)
-            blockers.forEach { Text("• ${it.vmName}: ${it.code}", style = MaterialTheme.typography.bodySmall) }
+            blockers.take(BLOCKERS_SHOWN).forEach { Text("• ${it.vmName}: ${it.code}", style = MaterialTheme.typography.bodySmall) }
+            // inventory scale: every blocker is read; the count is always the true one
+            if (blockers.size > BLOCKERS_SHOWN) Text("…and ${blockers.size - BLOCKERS_SHOWN} more (${blockers.size} VMs in total).", style = MaterialTheme.typography.bodySmall)
         }
         current.blockersProblem?.let { Text("Evacuation blockers could not be read ($it). The server still checks them.", style = MaterialTheme.typography.bodySmall) }
         val send = { action: TargetAction -> controller.request(action, current.authority, TargetKind.HOST, current.uuid) }
@@ -62,3 +64,6 @@ import com.meteor.app.storageView
     Text("Maintenance is separate steps: disable, evacuate, then reboot or shut down; enable the host afterwards. ${RoleRules.summary(state.selectedPermissions)}",
         style = MaterialTheme.typography.bodySmall)
 }
+
+// inventory scale
+private const val BLOCKERS_SHOWN = 50

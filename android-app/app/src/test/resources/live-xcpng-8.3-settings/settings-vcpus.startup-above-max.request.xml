@@ -1,0 +1,1 @@
+<?xml version="1.0" encoding="UTF-8"?><methodCall><methodName>VM.set_VCPUs_at_startup</methodName><params><param><value><string>OpaqueRef:4789a506-d9e7-4797-99c6-ef470b3ee809</string></value></param><param><value><string>OpaqueRef:24851764-ff8d-46bc-8802-64b0488adae7</string></value></param><param><value><string>2</string></value></param></params></methodCall>

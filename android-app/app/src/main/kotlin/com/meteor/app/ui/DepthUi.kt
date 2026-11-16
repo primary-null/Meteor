@@ -9,6 +9,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
 import com.meteor.app.DepthState
+import com.meteor.app.ControlGates
 import com.meteor.app.MeteorState
 import com.meteor.app.MeteorViewModel
 import com.meteor.app.data.HistoryRange
@@ -44,7 +45,7 @@ fun rememberDepthUi(state: MeteorState, model: MeteorViewModel, openNetworks: ()
             model::loadNetworks) { open() }
     }
     val authority = state.inventory?.authority
-    val idle = !state.loading && !state.profileBusy && !state.operationBusy
+    val idle = !state.loading && !state.profileBusy && !ControlGates.operationExclusive(state)
     return remember(state.depth, authority, state.connected, idle, actions) { DepthUi(state.depth, authority, state.connected, idle, actions) }
 }
 

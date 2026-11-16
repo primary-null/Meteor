@@ -5,38 +5,15 @@ import org.junit.Test
 
 class ObservabilityTest {
     private val target = MetricTarget("pool", "vm", MetricKind.VM, "Example VM")
-    private fun source(name: String, value: Any? = "0.25", enabled: Boolean = true, unit: String = "fraction") =
-        mapOf("name_label" to name, "value" to value, "enabled" to enabled, "units" to unit)
-    private fun sample(time: Long, target: MetricTarget = this.target) = MetricMapper.snapshot(target, listOf(source("cpu0")), time)
+    private val plan = LiveMetrics.plan(target, listOf(mapOf("name_label" to "cpu_usage", "enabled" to true, "units" to "(fraction)", "max" to 1.0)), null)
+    private fun sample(time: Long, target: MetricTarget = this.target, value: Double? = .25) =
+        LiveMetrics.snapshot(target, plan, mapOf("cpu_usage" to value), time)
 
-    @Test fun disabledAndNonfiniteMetricsStayMissing() {
-        val snapshot = MetricMapper.snapshot(target, listOf(source("cpu0", enabled = false), source("cpu1", "NaN"),
-            source("cpu2", "Infinity"), source("cpu3", "-1")), 1)
-        assertTrue(snapshot.readings.all { it.value == null && it.unavailable != null })
-    }
-    @Test fun advertisedUnitsAndMemoryMeaningArePreserved() {
-        val snapshot = MetricMapper.snapshot(target, listOf(source("memory", "1024", unit = "bytes"),
-            source("memory_internal_free", "12", unit = "KiB"), source("cpu0", unit = "")), 1)
-        assertEquals("Allocated memory", snapshot.readings.first { it.name == "memory" }.label)
-        assertEquals("Guest-reported free memory", snapshot.readings.first { it.name == "memory_internal_free" }.label)
-        assertEquals("", snapshot.readings.first { it.name == "cpu0" }.unit)
-    }
-    @Test fun sourceBudgetPrefersAverageAndNeverHidesOtherGroups() {
-        val sources = (0..30).map { source("cpu$it") } + source("cpu_avg") + source("vif_0_rx") + source("vbd_xvda_read")
-        val sample = MetricMapper.snapshot(target, sources, 1)
-        assertEquals(6, sample.readings.size)
-        assertTrue(sample.readings.any { it.name == "cpu_avg" })
-        assertEquals(sources.size, sample.advertisedCount)
-    }
-    @Test fun duplicateAndOversizedSourceIdentitiesAreRejected() {
-        assertTrue(runCatching { MetricMapper.snapshot(target, listOf(source("cpu0"), source("cpu0")), 1) }.isFailure)
-        assertTrue(runCatching { MetricMapper.snapshot(target, List(4097) { source("cpu$it") }, 1) }.isFailure)
-    }
     @Test fun sampleWindowIsBoundedAndMissingValuesAreRetained() {
         var window = emptyList<MetricSnapshot>()
         repeat(70) { window = MetricWindow.append(window, sample(it * 5000L)) }
         assertEquals(60, window.size)
-        val missing = MetricMapper.snapshot(target, listOf(source("cpu0", null)), 350_000)
+        val missing = sample(350_000, value = null)
         window = MetricWindow.append(window, missing)
         assertNull(window.last().readings.single().value)
         assertTrue(window.all { 350_000 - it.observedAt <= 300_000 })

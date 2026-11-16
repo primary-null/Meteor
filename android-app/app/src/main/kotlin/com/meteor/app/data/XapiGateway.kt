@@ -12,7 +12,6 @@ import kotlinx.coroutines.ensureActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.util.concurrent.atomic.AtomicBoolean
-import java.io.ByteArrayOutputStream
 import java.net.InetSocketAddress
 import java.net.URI
 import java.net.URL
@@ -119,19 +118,44 @@ interface MeteorGateway : PowerBackend {
      */
     suspend fun console(profile: Profile, authority: String, uuid: String, encodings: List<Int> = RfbEncoding.DEFAULT): ConsoleSession =
         throw UnsupportedOperationException()
+    /**
+     * Opens the console of the XCP-ng host [uuid] itself (its control domain's `rfb` console) on its own XAPI session, with
+     * the same pinning and member-trust review as a VM console. Not a host operation: nothing is journaled or sent.
+     */
+    suspend fun hostConsole(profile: Profile, authority: String, uuid: String, encodings: List<Int> = RfbEncoding.DEFAULT): ConsoleSession =
+        throw UnsupportedOperationException()
+    /** Read-only: whether the host offers a console Meteor can show, for the host details' button. */
+    suspend fun hostConsoleOffer(profile: Profile, authority: String, uuid: String): HostConsoleOffer = throw UnsupportedOperationException()
     // --- end B1 console ---
     // --- B3 background/summary --- read-only; none of these sends a write
     /**
-     * Background alert check in one short-lived session: the pool, A4's `message.get_since` read from [sinceMillis],
-     * and names for at most [BackgroundAlerts.MAX_NAMED_OBJECTS] objects of messages that match [wanted].
+     * Background alert check in one short-lived session: the pool, the server's clock (`host.get_servertime`), A4's
+     * `message.get_since` read from what [since] chooses once those are known, and names for at most
+     * [BackgroundAlerts.MAX_NAMED_OBJECTS] objects of messages that match [wanted].
      */
-    suspend fun backgroundAlerts(profile: Profile, sinceMillis: Long, wanted: (AlertMessage) -> Boolean): BackgroundAlertFetch =
+    suspend fun backgroundAlerts(profile: Profile, since: BackgroundSince, wanted: (AlertMessage) -> Boolean): BackgroundAlertFetch =
         throw UnsupportedOperationException()
     /** All-pools summary counts in one short-lived session. [lastSeen] is the A4 in-app "seen" value, read-only here. */
     suspend fun poolSummary(profile: Profile, lastSeen: Long?): PoolSummaryRead = throw UnsupportedOperationException()
     /** `host.call_plugin(host, "updater.py", "check_update", {})`, only on an explicit tap. Never `update`. */
     suspend fun checkHostUpdates(profile: Profile, authority: String, hostUuid: String): HostUpdateResult = throw UnsupportedOperationException()
     // --- end B3 ---
+    // --- inventory scale ---
+    /** On demand, bounded: the pool's VM templates with only what a picker needs. Read-only; no UI uses it yet. */
+    suspend fun templates(profile: Profile, authority: String): TemplateCatalog = throw UnsupportedOperationException()
+    // --- end inventory scale ---
+    // --- session reuse --- see SessionReuse.kt for ownership and lifetime
+    /** Names the one profile whose XAPI session the foreground methods keep open. Another identity replaces it. */
+    fun keepSession(profile: Profile) {}
+    /** Ends the shared session (best-effort logout); with [profileId], only if it belongs to that profile. */
+    fun releaseSession(profileId: String? = null) {}
+    /** The app went to the background (true) or came back (false); see [SessionReusePolicy.BACKGROUND_GRACE_MILLIS]. */
+    fun backgrounded(value: Boolean) {}
+    // --- end session reuse ---
+    // --- VM settings ---
+    /** Read-only: everything the settings editor shows for one VM. Writes go only through [PowerService.executeSettings]. */
+    suspend fun vmSettings(profile: Profile, authority: String, uuid: String): VmSettings = throw UnsupportedOperationException()
+    // --- end VM settings ---
 }
 
 class XapiGateway(private val clock: () -> Long = System::currentTimeMillis) : MeteorGateway {
@@ -148,18 +172,55 @@ class XapiGateway(private val clock: () -> Long = System::currentTimeMillis) : M
         XapiEventSession(connection, eventReadMarginMillis)
     }
     // --- end A4 ---
-    private suspend fun <T> session(profile: Profile, action: suspend XapiSession.() -> T): T = withContext(Dispatchers.IO) {
-        val connection = XapiSession(profile, clock)
-        try { connection.login(); connection.action() } finally { connection.close() }
+    // --- inventory scale --- limits of streamed pool-sized reads; settable so tests can shrink them
+    internal var streamLimits: StreamLimits = StreamLimits.DEFAULT
+    override suspend fun templates(profile: Profile, authority: String): TemplateCatalog = session(profile) { templates(authority) }
+    // --- end inventory scale ---
+    // --- session reuse --- foreground calls share the kept session of their exact identity; anything else logs in per call.
+    internal val reuse = SessionReuse()
+    /** The live view's source choices and a VM's disk devices, kept for a minute (see [LiveCache]). */
+    private val liveCache = LiveCache()
+    override fun keepSession(profile: Profile) = reuse.keep(profile)
+    override fun releaseSession(profileId: String?) = reuse.release(profileId)
+    override fun backgrounded(value: Boolean) = reuse.background(value)
+    private suspend fun <T> session(profile: Profile, action: suspend XapiSession.() -> T): T = abortableXapi { abort ->
+        val shared = reuse.hold(profile)
+        if (shared == null) ephemeralSession(profile, abort, action)
+        else try { XapiSession(profile, clock, shared, abort, liveCache, streamLimits).action() } catch (error: Exception) {
+            // A changed certificate ends the shared session; its logout can only reach a server that passes the pin.
+            if (error.pinFailure()) reuse.drop(shared)
+            throw error
+        } finally { reuse.leave(shared) }
     }
+    /** One session for this call only, logged out at the end: the per-run designs (background check, All pools) keep this. */
+    private suspend fun <T> ephemeral(profile: Profile, action: suspend XapiSession.() -> T): T =
+        abortableXapi { abort -> ephemeralSession(profile, abort, action) }
+    private suspend fun <T> ephemeralSession(profile: Profile, abort: CallAbort, action: suspend XapiSession.() -> T): T {
+        val connection = XapiSession(profile, clock, stop = abort, live = liveCache, limits = streamLimits)
+        try { connection.login(); return connection.action() } finally { connection.close() }
+    }
+    // --- end session reuse ---
     // --- B1 console ---
     override suspend fun console(profile: Profile, authority: String, uuid: String, encodings: List<Int>): ConsoleSession =
+        openConsole(profile, encodings, ConsoleSubject.VM) { ConsoleSession.location(consoleLocation(authority, uuid)) }
+    override suspend fun hostConsole(profile: Profile, authority: String, uuid: String, encodings: List<Int>): ConsoleSession =
+        openConsole(profile, encodings, ConsoleSubject.HOST) { hostConsoleUri(profile, authority, uuid) }
+    override suspend fun hostConsoleOffer(profile: Profile, authority: String, uuid: String): HostConsoleOffer = session(profile) {
+        try { hostConsoleUri(profile, authority, uuid); HostConsoleOffer(null) }
+        catch (error: ConsoleError) { HostConsoleOffer(error.message) }
+    }
+    private fun XapiSession.hostConsoleUri(profile: Profile, authority: String, uuid: String): java.net.URI {
+        val found = hostConsoleLocation(authority, uuid)
+        return ConsoleSession.location(found.location).also { HostConsoleRules.checkLocation(it, found, profile) }
+    }
+    private suspend fun openConsole(profile: Profile, encodings: List<Int>, subject: ConsoleSubject,
+        locate: XapiSession.() -> java.net.URI): ConsoleSession =
         withContext(Dispatchers.IO) {
             val connection = XapiSession(profile, clock)
             try {
                 connection.login()
-                val uri = ConsoleSession.location(connection.consoleLocation(authority, uuid))
-                val opened = ConsoleOpener.open(profile, uri, connection.consoleToken, { connection.close() }, encodings)
+                val uri = connection.locate()
+                val opened = ConsoleOpener.open(profile, uri, connection.consoleToken, { connection.close() }, encodings, subject)
                 // A cancelled caller must not leave a live tunnel or XAPI login behind.
                 try { ensureActive() } catch (cancelled: CancellationException) { opened.close(); throw cancelled }
                 opened
@@ -197,69 +258,57 @@ class XapiGateway(private val clock: () -> Long = System::currentTimeMillis) : M
     override suspend fun isoCatalog(profile: Profile, authority: String): IsoCatalog = session(profile) { isoCatalog(authority) }
     // --- end B2 storage/host ---
     // --- B3 background/summary ---
-    override suspend fun backgroundAlerts(profile: Profile, sinceMillis: Long, wanted: (AlertMessage) -> Boolean): BackgroundAlertFetch =
-        session(profile) { backgroundAlerts(sinceMillis, wanted) }
-    override suspend fun poolSummary(profile: Profile, lastSeen: Long?): PoolSummaryRead = session(profile) { poolSummary(lastSeen) }
+    override suspend fun backgroundAlerts(profile: Profile, since: BackgroundSince, wanted: (AlertMessage) -> Boolean): BackgroundAlertFetch =
+        ephemeral(profile) { backgroundAlerts(since, wanted) } // session reuse: one session per run, as before
+    override suspend fun poolSummary(profile: Profile, lastSeen: Long?): PoolSummaryRead = ephemeral(profile) { poolSummary(lastSeen) }
     override suspend fun checkHostUpdates(profile: Profile, authority: String, hostUuid: String): HostUpdateResult =
         session(profile) { checkHostUpdates(authority, hostUuid) }
     // --- end B3 ---
+    // --- VM settings ---
+    override suspend fun vmSettings(profile: Profile, authority: String, uuid: String): VmSettings =
+        session(profile) { settings(authority, uuid) ?: throw IllegalArgumentException("This VM no longer exists.") }
+    // --- end VM settings ---
 }
 
-private class XapiSession(private val profile: Profile, private val clock: () -> Long) : PowerConnection {
+private class XapiSession(private val profile: Profile, private val clock: () -> Long,
+    // --- session reuse --- [shared]: the kept foreground session; [stop]: cancellation of the gateway call
+    private val shared: SharedXapiSession? = null, private val stop: CallAbort? = null,
+    private val live: LiveCache = LiveCache(),
+    // --- end session reuse ---
+    private val limits: StreamLimits = StreamLimits.DEFAULT, // inventory scale
+) : PowerConnection {
     private val endpoint = Endpoints.normalize(profile.endpoint)
-    private val tls = ServerTrust.context(profile.certificateSha256)
+    // --- session reuse ---
+    private val transport = shared?.transport ?: XapiTransport(profile, keepAlive = false)
+    private val tls = transport.tls
+    // --- end session reuse ---
     private var session: String? = null
     init { require(profile.certificateSha256.matches(Regex("[0-9a-f]{64}"))) }
-    private val token get() = requireNotNull(session)
+    private val token get() = shared?.token() ?: requireNotNull(session)
     // A4: [readTimeoutMillis] and [abort] let the long-lived event session wait past the default 12 s and be cancelled.
     private fun call(method: String, args: List<Any?>, readTimeoutMillis: Int = 12_000, abort: CallAbort? = null): Any? {
-        val url = URL(endpoint)
-        val connection = url.openConnection() as HttpsURLConnection
-        try {
-            abort?.attach(connection)
-            connection.sslSocketFactory = tls.socketFactory
-            connection.hostnameVerifier = javax.net.ssl.HostnameVerifier { host, session ->
-                // Exact user-approved leaf pin identifies private/self-signed endpoints.
-                host == url.host &&
-                    (session.peerCertificates.firstOrNull() as? X509Certificate)?.let {
-                        ServerTrust.fingerprint(it) == profile.certificateSha256
-                    } == true
-            }
-            connection.instanceFollowRedirects = false
-            connection.connectTimeout = 8_000
-            connection.readTimeout = readTimeoutMillis
-            connection.requestMethod = "POST"
-            connection.doOutput = true
-            connection.setRequestProperty("Content-Type", "text/xml; charset=utf-8")
-            connection.setRequestProperty("User-Agent", "Meteor-Spark/${BuildConfig.VERSION_NAME}")
-            val bytes = XmlRpc.request(method, args)
-            connection.setFixedLengthStreamingMode(bytes.size)
-            connection.outputStream.use { it.write(bytes) }
-            if (connection.responseCode in 300..399) throw GatewayError("redirect-refused")
-            if (connection.responseCode != 200) throw GatewayError("http-error")
-            val output = ByteArrayOutputStream()
-            connection.inputStream.use { stream ->
-                val buffer = ByteArray(16 * 1024)
-                while (true) {
-                    val count = stream.read(buffer)
-                    if (count == -1) break
-                    if (output.size() + count > 8 * 1024 * 1024) throw GatewayError("response-limit")
-                    output.write(buffer, 0, count)
-                }
-            }
-            return XmlRpc.response(output.toString(Charsets.UTF_8.name()))
-        } finally {
-            connection.disconnect()
+        // --- session reuse ---
+        val read = XapiMethods.isRead(method)
+        val cancel = abort ?: stop
+        // A write is never started for a caller that was already cancelled; nothing has been sent, so it is NotSent.
+        if (!read && cancel?.isAborted == true) throw NotSent("The request was cancelled before sending.")
+        val link = shared
+        return try { transport.post(method, args, readTimeoutMillis, cancel.takeIf { read }) } catch (error: RpcFailure) {
+            // A read refused with SESSION_INVALID logs in again once (shared with racing callers) and is repeated once.
+            // A write is never repeated: its SESSION_INVALID reaches the caller as the explicit rejection it is.
+            if (link == null || !read || error.code != "SESSION_INVALID") throw error
+            val stale = args.firstOrNull() as? String ?: throw error
+            val fresh = link.relogin(stale)
+            transport.post(method, args.map { if (it == stale) fresh else it }, readTimeoutMillis, cancel)
         }
+        // --- end session reuse ---
     }
     private fun callForText(method: String, args: List<Any?>): String =
         call(method, args) as? String ?: throw GatewayError("invalid-reference")
     fun login() {
-        session = call("session.login_with_password",
-            listOf(profile.username, profile.password, "1.0", "MeteorAndroidSpark")) as? String
-            ?: throw GatewayError("session-missing")
+        session = transport.login() // session reuse: same request; login and logout are never cut off by cancellation
     }
-    fun close() { session?.let { runCatching { call("session.logout", listOf(it)) } }; session = null }
+    fun close() { session?.let { runCatching { transport.logout(it) } }; session = null }
     private fun record(type: String, ref: String): Map<String, Any?> = map(call("$type.get_record", listOf(token, ref)))
     private fun map(value: Any?): Map<String, Any?> {
         val data = value as? Map<*, *> ?: throw GatewayError("invalid-record")
@@ -272,14 +321,104 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
             key to map(entry.value)
         }
     }
-    fun inventory(): Inventory = InventoryMapper.normalize(records("pool"), records("host"), records("host_metrics"),
-        records("VM"), records("SR"), System.currentTimeMillis())
+    // --- inventory scale --- streamed, projected reads (InventoryScale.kt). Every method here is a `get_*` read, so a
+    // shared session's SESSION_INVALID is answered by one re-login and one repeat, exactly as in [call].
+    private fun <T> streamCall(method: String, args: List<Any?>, read: (java.io.InputStream) -> T): T {
+        val link = shared
+        return try { transport.postStream(method, args, 12_000, stop, limits.maxBytes, read) } catch (error: RpcFailure) {
+            if (link == null || error.code != "SESSION_INVALID") throw error
+            val stale = args.firstOrNull() as? String ?: throw error
+            val fresh = link.relogin(stale)
+            transport.postStream(method, args.map { if (it == stale) fresh else it }, 12_000, stop, limits.maxBytes, read)
+        }
+    }
+    private fun projected(type: String, projection: Projection, maxRecords: Int = limits.maxRecords,
+        keep: (Map<String, Any?>) -> Boolean = { true }): RecordsRead =
+        streamCall("$type.get_all_records", listOf(token)) { XmlRpcRecords.collect(it, projection, maxRecords, limits, keep) }
+    private fun projectedWhere(type: String, filter: String, projection: Projection, maxRecords: Int = limits.maxRecords): RecordsRead =
+        streamCall("$type.get_all_records_where", listOf(token, filter)) { XmlRpcRecords.collect(it, projection, maxRecords, limits) }
+    /** Every record whose [field] is one of [values], in `or` chains of [XapiQuery.BATCH]. An unsafe literal cannot name a real object. */
+    private fun whereAny(type: String, field: String, values: Collection<String>, projection: Projection): Map<String, Map<String, Any?>> {
+        val out = LinkedHashMap<String, Map<String, Any?>>()
+        XapiQuery.anyOf(field, values.filter { !isNull(it) && XapiQuery.isSafe(it) }).forEach { filter ->
+            val read = projectedWhere(type, filter, projection)
+            if (!read.complete) throw GatewayError("invalid-records")
+            out.putAll(read.records)
+        }
+        return out
+    }
+    /** Records of known references; one that no longer exists is simply absent (as `HANDLE_INVALID` was per record). */
+    private fun byRefs(type: String, refs: Collection<String>, projection: Projection) = whereAny(type, "_ref", refs, projection)
+
+    /** Pool, hosts, host metrics, normal VMs (filtered by the server) and storage. A VM list beyond the limits is reported, not hidden. */
+    fun inventory(): Inventory {
+        val pools = projected("pool", Projections.POOL).records
+        val hosts = projected("host", Projections.HOST).records
+        val metrics = projected("host_metrics", Projections.HOST_METRICS).records
+        val notices = ArrayList<String>()
+        val vms = try { guests() } catch (error: Exception) {
+            if (!error.isResponseLimit()) throw error
+            notices += InventoryNotices.guestsUnreadable(error); null
+        }
+        if (vms != null && !vms.complete) notices += InventoryNotices.guestsCapped(vms.records.size, vms.total)
+        val srs = projected("SR", Projections.SR).records
+        return InventoryMapper.normalize(pools, hosts, metrics, vms?.records.orEmpty(), srs, clock()).copy(notLoaded = notices)
+    }
+    /** Normal VMs only. A server without `get_all_records_where` sends every VM record; templates and snapshots are then skipped here. */
+    private fun guests(): RecordsRead = try { projectedWhere("VM", XapiQuery.GUESTS, Projections.GUEST) } catch (error: RpcFailure) {
+        if (error.code != "MESSAGE_METHOD_UNKNOWN") throw error
+        projected("VM", Projections.GUEST) { !it.flag("is_a_template") && !it.flag("is_control_domain") && !it.flag("is_a_snapshot") }
+    }
+    /** Templates for a future picker: one filtered read, at most [Templates.MAX] kept. */
+    fun templates(authority: String): TemplateCatalog {
+        verifyPool(authority)
+        val read = projectedWhere("VM", XapiQuery.TEMPLATES, Projections.TEMPLATE, Templates.MAX)
+        verifyPool(authority)
+        return Templates.map(authority, read, clock())
+    }
+    /**
+     * The one message read the Alerts inbox and pool activity share. Full: every message is parsed as it arrives and only
+     * the [AlertMerge.MAX_KEPT] newest are kept, with the true count. If even that answer exceeds the stream limits, only
+     * the recent window is requested and [MessageWindow.fallback] says so. Incremental: `message.get_since`.
+     */
+    private fun messageWindow(sinceMillis: Long?): MessageWindow {
+        fun since(millis: Long) = streamCall("message.get_since", listOf(token, XmlRpcDateTime(millis))) {
+            XmlRpcRecords.newest(it, Projections.MESSAGE, AlertMerge.MAX_KEPT, MessageWindow::time, limits)
+        }
+        if (sinceMillis != null) return MessageWindow(since(sinceMillis), full = false, fallback = false)
+        return try {
+            MessageWindow(streamCall("message.get_all_records", listOf(token)) {
+                XmlRpcRecords.newest(it, Projections.MESSAGE, AlertMerge.MAX_KEPT, MessageWindow::time, limits)
+            }, full = true, fallback = false)
+        } catch (error: Exception) {
+            if (!error.isResponseLimit()) throw error
+            MessageWindow(since(clock() - AlertMerge.FALLBACK_WINDOW_MILLIS), full = false, fallback = true)
+        }
+    }
+    // --- end inventory scale ---
+    private fun liveKey(target: MetricTarget) = LiveCache.Key(profile.id, endpoint, target.kind, target.uuid)
+    /** Non-CD disk devices of a VM record, for example `xvda`. CD drives also have `vbd_*` series but are not disks. */
+    private fun diskDevices(target: MetricTarget, vm: Map<String, Any?>): Set<String> {
+        val key = liveKey(target)
+        live.disks(key, clock())?.let { return it }
+        val devices = vm.strings("VBDs").take(16).mapNotNull { optionalRecord("VBD", it) }
+            .filter { it.text("type") == "Disk" }.map { it.text("device") }.filter { it.isNotBlank() }.toSet()
+        live.putDisks(key, devices, clock())
+        return devices
+    }
+    /**
+     * One live tick: identity checks, then the current value of each planned source with `query_data_source`
+     * (`get_data_sources` reports 0.0 for every value on a real server). The plan comes from the cache when it is
+     * under a minute old, so a warm tick is the checks plus one small read per source and no catalogue download.
+     */
     fun metrics(target: MetricTarget): MetricSnapshot {
         val type = if (target.kind == MetricKind.VM) "VM" else "host"
+        var vmRecord: Map<String, Any?>? = null
         val reference = if (target.kind == MetricKind.VM) {
             val (reference, vm) = readVm(target.authority, target.uuid)
             if (vm.text("power_state") != "Running") return MetricSnapshot(target, clock(), emptyList(), 0,
                 "The VM is not running. Live metrics are unavailable.")
+            vmRecord = vm
             reference
         } else {
             verifyPool(target.authority)
@@ -287,8 +426,21 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
                 require(record("host", it)["uuid"] == target.uuid) { "Host identity changed." }
             }
         }
-        val sources = call("$type.get_data_sources", listOf(token, reference)) as? List<*> ?: throw GatewayError("invalid-metrics")
-        val snapshot = MetricMapper.snapshot(target, sources.map(::map), clock())
+        val key = liveKey(target)
+        val plan = live.plan(key, clock()) ?: run {
+            val sources = call("$type.get_data_sources", listOf(token, reference)) as? List<*> ?: throw GatewayError("invalid-metrics")
+            LiveMetrics.plan(target, sources.map(::map), vmRecord?.let { diskDevices(target, it) }).also { live.putPlan(key, it, clock()) }
+        }
+        val values = LinkedHashMap<String, Double?>()
+        for (name in plan.queryNames) {
+            values[name] = try { LiveMetrics.sample(call("$type.query_data_source", listOf(token, reference, name))) }
+            catch (error: RpcFailure) {
+                // A source that was listed and is gone (the server answers INTERNAL_ERROR) is a gap; choose again next tick.
+                if (error.code != "INTERNAL_ERROR") throw error
+                live.dropPlan(key); null
+            }
+        }
+        val snapshot = LiveMetrics.snapshot(target, plan, values, clock())
         verifyPool(target.authority)
         return snapshot
     }
@@ -305,7 +457,7 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     fun activity(authority: String): PoolActivity {
         verifyPool(authority)
         val tasks = section { ActivityMapper.tasks(records("task")) }
-        val alerts = section { ActivityMapper.alerts(records("message")) }
+        val alerts = section { MessageWindow.activity(messageWindow(null)) } // inventory scale: shared large-store read
         verifyPool(authority)
         return PoolActivity(authority, clock(), tasks, alerts)
     }
@@ -343,6 +495,7 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     fun history(target: MetricTarget, range: HistoryRange, sinceSeconds: Long?): HistorySnapshot {
         val coordinator = poolRecord(target.authority).text("master")
         val isHost = target.kind == MetricKind.HOST
+        var disks: Set<String>? = null
         if (isHost) {
             val ref = callForText("host.get_by_uuid", listOf(token, target.uuid))
             val host = record("host", ref)
@@ -353,6 +506,7 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
             val resident = vm.text("resident_on")
             val residentName = liveRef(resident)?.takeIf { it != coordinator }?.let { optionalRecord("host", it)?.text("name_label") }
             HistoryRouting.vmReason(vm.text("power_state"), resident, coordinator, residentName)?.let { throw HistoryUnavailable(it) }
+            disks = diskDevices(target, vm)
         }
         val serverText = optionalText("host.get_servertime", listOf(token, coordinator))
         val serverNow = serverText?.let { ActivityMapper.time(it) }?.div(1000)
@@ -360,21 +514,24 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
         // The session reference travels in the query, so it is validated and the URL is never logged or reported.
         if (!token.matches(Regex("[A-Za-z0-9:._-]{1,200}"))) throw GatewayError("invalid-session")
         val url = URL("${endpoint}rrd_updates?session_id=$token&start=${query.startSeconds}&cf=AVERAGE&interval=${query.intervalSeconds}" +
-            (if (isHost) "&host=true" else "") + "&json=true")
+            (if (isHost) "&host=true" else "") + "&json=true" +
+            // A host answer holds the host and every VM on it. Asking for one VM keeps a busy host's answer small (XCP-ng 8.3; others ignore it).
+            (if (!isHost && target.uuid.matches(Regex("[A-Za-z0-9-]{1,64}"))) "&vm_uuid=${target.uuid}" else ""))
         val body = PinnedHttp.get(url, profile.certificateSha256, tls, "application/json, application/xml;q=0.8",
             "Meteor-Spark/${BuildConfig.VERSION_NAME}", readTimeoutMs = 20_000, maxBytes = RrdParser.MAX_BYTES)
         val kind = if (isHost) "host" else "vm"
         val update = RrdParser.parse(body) { it.consolidation == "AVERAGE" && it.kind == kind && it.uuid == target.uuid.lowercase() }
-        val snapshot = HistoryMapper.build(target, range, update, clock(), serverNow)
+        val snapshot = HistoryMapper.build(target, range, update, clock(), serverNow, disks)
         verifyPool(target.authority)
         return snapshot
     }
 
     fun vmInfo(authority: String, uuid: String): VmInfo {
         val pool = poolRecord(authority)
-        val vm = readVm(authority, uuid).second
-        val snapshots = vm.strings("snapshots").take(VmInfoMapper.MAX_SNAPSHOTS).mapNotNull { optionalRecord("VM", it) }
-        val drives = vm.strings("VBDs").take(16).mapNotNull { optionalRecord("VBD", it) }
+        val (vmRef, vm) = readVm(authority, uuid)
+        // inventory scale: every snapshot (so the newest are shown, not the first refs) and every drive, one read each
+        val snapshots = projectedWhere("VM", XapiQuery.snapshotsOf(vmRef), Projections.SNAPSHOT).records.values.toList()
+        val drives = projectedWhere("VBD", XapiQuery.eq("VM", vmRef), Projections.VBD).records.values.toList()
         val isoNames = drives.filter { it.text("type") == "CD" && !it.flag("empty") }.mapNotNull { drive ->
             liveRef(drive.text("VDI"))?.let { ref -> optionalRecord("VDI", ref)?.let { ref to it.text("name_label") } }
         }.toMap()
@@ -387,7 +544,7 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
         val ref = callForText("host.get_by_uuid", listOf(token, uuid))
         val host = record("host", ref)
         require(host["uuid"] == uuid) { "Host identity changed." }
-        val pifs = records("PIF").values.filter { it.text("host") == ref }
+        val pifs = projectedWhere("PIF", XapiQuery.eq("host", ref), Projections.PIF).records.values.filter { it.text("host") == ref } // inventory scale
         val metrics = records("PIF_metrics")
         val before = clock()
         val serverTime = optionalText("host.get_servertime", listOf(token, ref))
@@ -398,7 +555,7 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
 
     fun networks(authority: String): NetworkOverview {
         poolRecord(authority)
-        val hosts = records("host")
+        val hosts = projected("host", Projections.HOST).records // inventory scale
         val networks = records("network")
         val pifs = records("PIF")
         val metrics = records("PIF_metrics")
@@ -411,14 +568,14 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
         val ref = callForText("SR.get_by_uuid", listOf(token, uuid))
         val sr = record("SR", ref)
         require(sr["uuid"] == uuid) { "Storage identity changed." }
-        val hosts = records("host")
-        val pbds = records("PBD").values.filter { it.text("SR") == ref }
+        val hosts = projected("host", Projections.HOST).records // inventory scale
+        val pbds = projectedWhere("PBD", XapiQuery.eq("SR", ref), Projections.PBD).records.values.filter { it.text("SR") == ref }
         val allDisks = sr.strings("VDIs")
-        // Bounded: at most MAX_VDIS individual reads, and the pool-wide VBD/VM lists only when a shown disk is in use.
+        // Bounded: at most MAX_VDIS individual reads, then only the VBDs and VMs of those disks (inventory scale: never the
+        // pool-wide VBD and VM lists, which hold every snapshot and template).
         val disks = allDisks.take(StorageMapper.MAX_VDIS).mapNotNull { optionalRecord("VDI", it) }
-        val inUse = disks.any { it.strings("VBDs").isNotEmpty() }
-        val vbds = if (inUse) records("VBD") else emptyMap()
-        val vms = if (inUse) records("VM") else emptyMap()
+        val vbds = byRefs("VBD", disks.flatMap { it.strings("VBDs") }, Projections.VBD)
+        val vms = byRefs("VM", vbds.values.map { it.text("VM") }, Projections.VM_NAME)
         verifyPool(authority)
         return StorageMapper.map(authority, sr, hosts, pbds, disks, allDisks.size, vbds, vms, clock())
     }
@@ -435,6 +592,30 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
         throw if (records.any { it.text("protocol").equals("vt100", true) }) ConsoleError(
             "This VM offers only a text (vt100) console, which Meteor cannot display.", ConsoleFailureKind.NO_CONSOLE)
         else ConsoleError("This VM has no graphical console yet. It may still be starting; try again shortly.", ConsoleFailureKind.NO_CONSOLE)
+    }
+    /**
+     * Host console: reads only. Pool identity, then the host by UUID, its liveness, its control domain (the host record's
+     * `control_domain`, or for servers without that field the single control domain resident on the host), that VM's
+     * consoles, and the pool identity again. The control domain is refused by every VM path ([readVm], [normalVm]); this is
+     * the only place it is read, and only to find its `rfb` console.
+     */
+    fun hostConsoleLocation(authority: String, uuid: String): HostConsoleLocation {
+        val pool = poolRecord(authority)
+        val ref = callForText("host.get_by_uuid", listOf(token, uuid))
+        val host = record("host", ref)
+        require(host["uuid"] == uuid) { "Host identity changed." }
+        if (recordOrNull("host_metrics", host.text("metrics"))?.flag("live") != true)
+            throw ConsoleError(HostConsoleRules.NOT_LIVE, ConsoleFailureKind.NOT_RUNNING)
+        val dom0Ref = HostConsoleRules.namedControlDomain(host) ?: HostConsoleRules.fallbackControlDomain(ref,
+            projectedWhere("VM", "${XapiQuery.eq("is_control_domain", "true")} and ${XapiQuery.eq("resident_on", ref)}",
+                Projection(setOf("uuid", "is_control_domain", "resident_on", "is_a_template", "is_a_snapshot")), 4).records)
+            ?: throw ConsoleError(HostConsoleRules.NO_CONTROL_DOMAIN, ConsoleFailureKind.NO_CONSOLE)
+        val dom0 = record("VM", dom0Ref)
+        if (!HostConsoleRules.isControlDomainOf(ref, dom0)) throw ConsoleError(HostConsoleRules.NO_CONTROL_DOMAIN, ConsoleFailureKind.NO_CONSOLE)
+        val consoles = dom0.strings("consoles").take(HostConsoleRules.MAX_CONSOLES).mapNotNull { recordOrNull("console", it) }
+        val location = HostConsoleRules.chooseConsole(dom0Ref, consoles)
+        verifyPool(authority)
+        return HostConsoleLocation(location, host.text("address"), pool.text("master") == ref)
     }
     // --- end B1 console ---
     override suspend fun details(authority: String, uuid: String): VmDetails = readDetails(authority, uuid, null)
@@ -474,14 +655,18 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     // --- A2 operations ---
     /** One async call per kind, built from the kind's declaration. Callers journal SUBMITTING first. */
     override suspend fun submitOperation(authority: String, uuid: String, action: PowerAction, targetHost: String?): String {
-        require(action.requestable) { "This action cannot be sent." }
-        val ref = vmRef(authority, uuid)
-        val hostRef = targetHost?.let { target ->
-            callForText("host.get_by_uuid", listOf(token, target)).also {
-                require(record("host", it)["uuid"] == target) { "Host identity changed." }
+        // Journaled operation hardening: every read and argument check before the one write call fails as NotSent.
+        val arguments = beforeSend("VM") {
+            require(action.requestable) { "This action cannot be sent." }
+            val ref = vmRef(authority, uuid)
+            val hostRef = targetHost?.let { target ->
+                callForText("host.get_by_uuid", listOf(token, target)).also {
+                    require(record("host", it)["uuid"] == target) { "Host identity changed." }
+                }
             }
+            listOf(token) + action.xapiArguments(ref, hostRef)
         }
-        return callForText(action.xapiMethod, listOf(token) + action.xapiArguments(ref, hostRef))
+        return callForText(action.xapiMethod, arguments)
     }
     private fun hostChoice(host: Map<String, Any?>, metrics: Map<String, Any?>, resident: Boolean) =
         HostChoice(host.text("uuid").also { if (it.isBlank()) throw GatewayError("invalid-host") }, host.text("name_label").ifBlank { "Unnamed host" },
@@ -497,8 +682,8 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     fun hostChoices(authority: String, vmUuid: String): List<HostChoice> {
         val (_, vm) = readVm(authority, vmUuid)
         val resident = vm.text("resident_on").takeIf { vm.text("power_state") != "Halted" }
-        val metrics = records("host_metrics")
-        val hosts = records("host").map { (ref, host) -> hostChoice(host, metrics[host.text("metrics")].orEmpty(), ref == resident) }
+        val metrics = projected("host_metrics", Projections.HOST_METRICS).records // inventory scale
+        val hosts = projected("host", Projections.HOST).records.map { (ref, host) -> hostChoice(host, metrics[host.text("metrics")].orEmpty(), ref == resident) }
         verifyPool(authority)
         return hosts.sortedBy { it.name.lowercase() }
     }
@@ -541,17 +726,18 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
         val record = record(kind.xapiClass, ref)
         require(record["uuid"] == uuid) { "Object identity changed." }
         return when (kind) {
-            TargetKind.VM -> vmTarget(authority, record)
+            TargetKind.VM -> vmTarget(authority, ref, record)
             TargetKind.SNAPSHOT -> snapshotTarget(authority, record)
             TargetKind.VBD -> cdDrive(authority, record)
             TargetKind.HOST -> hostState(authority, ref, record)
             TargetKind.PBD -> pbdState(authority, record)
         }
     }
-    private fun vmTarget(authority: String, vm: Map<String, Any?>): VmTarget {
+    private fun vmTarget(authority: String, ref: String, vm: Map<String, Any?>): VmTarget {
         require(normalVm(vm)) { "This object cannot be managed as a VM." }
-        val snapshotRefs = vm.strings("snapshots")
-        val snapshots = snapshotRefs.take(MAX_SNAPSHOTS).mapNotNull { recordOrNull("VM", it) }.filter { it.flag("is_a_snapshot") }.map { snap ->
+        // inventory scale: every snapshot of the VM in one filtered read, so snapshot proofs never rest on a cut list
+        val read = projectedWhere("VM", XapiQuery.snapshotsOf(ref), Projections.SNAPSHOT)
+        val snapshots = read.records.values.filter { it.flag("is_a_snapshot") && it.text("snapshot_of") == ref }.map { snap ->
             SnapshotInfo(snap.text("uuid"), snap.text("name_label"), snap.text("snapshot_time").ifBlank { null }, withMemory(snap),
                 snap.strings("allowed_operations").toSet(), busy(snap))
         }.sortedByDescending { it.time.orEmpty() }
@@ -562,7 +748,7 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
         val power = vm.text("power_state")
         val drives = vbds.filter { it.text("type") == "CD" }.map { cdDriveFrom(authority, it, vm.text("uuid"), name, power) }.sortedBy { it.device }
         return VmTarget(authority, vm.text("uuid"), name, power, vm.strings("allowed_operations").toSet(), busy(vm), clock(),
-            snapshots, snapshotRefs.size > MAX_SNAPSHOTS, parent, disks, drives)
+            snapshots, !read.complete, parent, disks, drives)
     }
     private fun snapshotTarget(authority: String, snap: Map<String, Any?>): SnapshotTarget {
         require(snap.flag("is_a_snapshot") && !snap.flag("is_control_domain")) { "This object is not a VM snapshot." }
@@ -597,14 +783,16 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     private fun hostState(authority: String, ref: String, host: Map<String, Any?>): HostState {
         val master = records("pool").values.single()["master"] == ref
         val boot = (host["other_config"] as? Map<*, *>)?.get("boot_time")?.toString()?.takeIf { it.isNotBlank() }
-        val resident = host.strings("resident_VMs").mapNotNull { recordOrNull("VM", it) }.filterNot { it.flag("is_control_domain") }
+        // inventory scale: resident VMs and blockers are named in batches, not one record read per VM
+        val resident = byRefs("VM", host.strings("resident_VMs"), Projections.VM_NAME).values.filterNot { it.flag("is_control_domain") }
             .map { it.text("name_label").ifBlank { "Unnamed VM" } }.sorted()
         var problem: String? = null
         val blockers = if (resident.isEmpty()) emptyList() else try {
             val map = call("host.get_vms_which_prevent_evacuation", listOf(token, ref)) as? Map<*, *> ?: throw GatewayError("invalid-blockers")
-            map.entries.take(MAX_BLOCKERS).map { (vmRef, reasons) ->
+            val names = byRefs("VM", map.keys.map { it.toString() }, Projections.VM_NAME)
+            map.entries.map { (vmRef, reasons) ->
                 val code = (reasons as? List<*>)?.firstOrNull()?.toString()?.takeIf { it.matches(Regex("[A-Z0-9_]{1,64}")) } ?: "UNKNOWN_REASON"
-                EvacuationBlocker(recordOrNull("VM", vmRef.toString())?.text("name_label")?.ifBlank { null } ?: "Unnamed VM", code)
+                EvacuationBlocker(names[vmRef.toString()]?.text("name_label")?.ifBlank { null } ?: "Unnamed VM", code)
             }.sortedBy { it.vmName.lowercase() }
         } catch (error: RpcFailure) {
             if (error.code == "SESSION_AUTHENTICATION_FAILED") throw error
@@ -621,23 +809,27 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     }
     fun poolPbds(authority: String): List<PbdState> {
         verifyPool(authority)
-        val srs = records("SR"); val hosts = records("host"); val metrics = records("host_metrics")
+        // inventory scale: projected reads and no cut; every PBD of the pool is returned
+        val srs = projected("SR", Projections.SR).records; val hosts = projected("host", Projections.HOST).records
+        val metrics = projected("host_metrics", Projections.HOST_METRICS).records
         val now = clock()
-        return records("PBD").values.mapNotNull { pbd ->
+        return projected("PBD", Projections.PBD).records.values.mapNotNull { pbd ->
             val sr = srs[pbd.text("SR")] ?: return@mapNotNull null
             val host = hosts[pbd.text("host")] ?: return@mapNotNull null
             PbdState(authority, pbd.text("uuid"), sr.text("uuid"), sr.text("name_label").ifBlank { "Storage repository" }, host.text("uuid"),
                 host.text("name_label").ifBlank { "Unnamed host" }, metrics[host.text("metrics")]?.flag("live") == true,
                 pbd.flag("currently_attached"), busy(sr), now)
-        }.sortedWith(compareBy({ it.srName.lowercase() }, { it.hostName.lowercase() })).take(MAX_PBDS)
+        }.sortedWith(compareBy({ it.srName.lowercase() }, { it.hostName.lowercase() }))
     }
     fun isoCatalog(authority: String): IsoCatalog {
         verifyPool(authority)
-        val isoSrs = records("SR").filterValues { it.text("content_type") == "iso" }
-        val isos = records("VDI").values.filter { it.text("SR") in isoSrs && !it.flag("is_a_snapshot") && !it.flag("missing") }.map { vdi ->
+        // inventory scale: only the VDIs of ISO repositories, never every disk and snapshot disk of the pool
+        val isoSrs = projectedWhere("SR", XapiQuery.eq("content_type", "iso"), Projections.SR).records.filterValues { it.text("content_type") == "iso" }
+        val isos = whereAny("VDI", "SR", isoSrs.keys, Projections.ISO).values
+            .filter { it.text("SR") in isoSrs && !it.flag("is_a_snapshot") && !it.flag("missing") }.map { vdi ->
             IsoChoice(vdi.text("uuid"), vdi.text("name_label").ifBlank { "Unnamed ISO" }, isoSrs.getValue(vdi.text("SR")).text("name_label"))
         }.filter { it.uuid.isNotBlank() }.sortedBy { it.name.lowercase() }
-        return IsoCatalog(isos.take(MAX_ISOS), isos.size > MAX_ISOS)
+        return IsoCatalog(isos.take(MAX_ISOS), isos.size > MAX_ISOS, isos.size)
     }
     override suspend fun iso(authority: String, uuid: String): IsoChoice {
         verifyPool(authority)
@@ -649,20 +841,23 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     }
     /** One async call per kind. Identity is checked again at send time; a failed check sends nothing ([NotSent]). */
     override suspend fun submitTarget(authority: String, action: TargetAction, target: String, argument: String?): String {
-        val ref = refByUuid(action.targetKind.xapiClass, target) ?: throw NotSent("The ${action.targetKind.label} no longer exists.")
-        val record = record(action.targetKind.xapiClass, ref)
-        if (record["uuid"] != target) throw NotSent("Object identity changed.")
-        when (action.targetKind) {
-            TargetKind.VM -> if (!normalVm(record)) throw NotSent("This object cannot be managed as a VM.")
-            TargetKind.SNAPSHOT -> if (!record.flag("is_a_snapshot")) throw NotSent("This object is not a VM snapshot.")
-            TargetKind.VBD -> if (record.text("type") != "CD") throw NotSent("This drive is not a CD drive.")
-            TargetKind.HOST, TargetKind.PBD -> Unit
+        val (primary, alternate) = beforeSend(action.targetKind.label) { // journaled operation hardening
+            val ref = refByUuid(action.targetKind.xapiClass, target) ?: throw NotSent("The ${action.targetKind.label} no longer exists.")
+            val record = record(action.targetKind.xapiClass, ref)
+            if (record["uuid"] != target) throw NotSent("Object identity changed.")
+            when (action.targetKind) {
+                TargetKind.VM -> if (!normalVm(record)) throw NotSent("This object cannot be managed as a VM.")
+                TargetKind.SNAPSHOT -> if (!record.flag("is_a_snapshot")) throw NotSent("This object is not a VM snapshot.")
+                TargetKind.VBD -> if (record.text("type") != "CD") throw NotSent("This drive is not a CD drive.")
+                TargetKind.HOST, TargetKind.PBD -> Unit
+            }
+            val value = when (action) {
+                TargetAction.CD_INSERT -> refByUuid("VDI", requireNotNull(argument)) ?: throw NotSent("The ISO no longer exists.")
+                else -> argument
+            }
+            action.xapiArguments(ref, value) to action.alternateArguments(ref, value)
         }
-        val value = when (action) {
-            TargetAction.CD_INSERT -> refByUuid("VDI", requireNotNull(argument)) ?: throw NotSent("The ISO no longer exists.")
-            else -> argument
-        }
-        return XapiArity.send(action.xapiArguments(ref, value), action.alternateArguments(ref, value)) { args ->
+        return XapiArity.send(primary, alternate) { args ->
             callForText(action.xapiMethod, listOf(token) + args)
         }
     }
@@ -672,35 +867,105 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
     }
     /** Destroys only snapshot objects: a snapshot VDI used by snapshots alone, or a snapshot VM record. */
     override suspend fun submitStep(authority: String, step: OperationStep): String {
-        val ref = refByUuid(step.kind.xapiClass, step.uuid) ?: throw NotSent("“${step.name}” no longer exists.")
-        val record = record(step.kind.xapiClass, ref)
-        if (record["uuid"] != step.uuid) throw NotSent("Object identity changed.")
-        when (step.kind) {
-            StepKind.VDI_DESTROY -> {
-                if (!record.flag("is_a_snapshot")) throw NotSent("“${step.name}” is not a snapshot disk.")
-                val users = record.strings("VBDs").mapNotNull { recordOrNull("VBD", it) }.map { recordOrNull("VM", it.text("VM")) }
-                if (users.any { it == null || !it.flag("is_a_snapshot") }) throw NotSent("“${step.name}” is used by a VM that is not a snapshot.")
+        val ref = beforeSend("“${step.name}”") { // journaled operation hardening
+            val ref = refByUuid(step.kind.xapiClass, step.uuid) ?: throw NotSent("“${step.name}” no longer exists.")
+            val record = record(step.kind.xapiClass, ref)
+            if (record["uuid"] != step.uuid) throw NotSent("Object identity changed.")
+            when (step.kind) {
+                StepKind.VDI_DESTROY -> {
+                    if (!record.flag("is_a_snapshot")) throw NotSent("“${step.name}” is not a snapshot disk.")
+                    val users = record.strings("VBDs").mapNotNull { recordOrNull("VBD", it) }.map { recordOrNull("VM", it.text("VM")) }
+                    if (users.any { it == null || !it.flag("is_a_snapshot") }) throw NotSent("“${step.name}” is used by a VM that is not a snapshot.")
+                }
+                StepKind.VM_DESTROY -> if (!record.flag("is_a_snapshot") || record.flag("is_control_domain")) throw NotSent("Refusing to destroy a VM that is not a snapshot.")
             }
-            StepKind.VM_DESTROY -> if (!record.flag("is_a_snapshot") || record.flag("is_control_domain")) throw NotSent("Refusing to destroy a VM that is not a snapshot.")
+            ref
         }
         return callForText(step.kind.xapiMethod, listOf(token, ref))
     }
     // --- end B2 storage/host ---
+    // --- journaled operation hardening ---
+    /**
+     * Runs the read-only checks that precede exactly one write call. Nothing in [checks] writes, so any failure
+     * here provably happens before the write request is built or put on the wire, and is reported as [NotSent].
+     * The write call itself always stays outside, so its failures remain uncertain.
+     */
+    private inline fun <T> beforeSend(subject: String, checks: () -> T): T = try { checks() }
+        catch (error: NotSent) { throw error }
+        catch (error: CancellationException) { throw error }
+        catch (error: IllegalArgumentException) {
+            throw NotSent(error.message?.takeIf { it.isNotBlank() && it != "Failed requirement." } ?: "The $subject changed before sending.")
+        } catch (error: Exception) {
+            val reason = when (error) {
+                is RpcFailure -> error.code; is GatewayError -> error.reason; is java.io.IOException -> "network error"; else -> "unexpected reply"
+            }
+            throw NotSent("Could not read the $subject again just before sending ($reason).")
+        }
+    override suspend fun verifyPoolIdentity(authority: String) = verifyPool(authority)
+    /** Pool identity, then the VM record, its metrics (boot marker) and resident host. No disk, network or guest reads. */
+    override suspend fun vmState(authority: String, uuid: String): VmDetails? {
+        verifyPool(authority)
+        val ref = refByUuid("VM", uuid) ?: return null
+        val vm = record("VM", ref)
+        require(vm["uuid"] == uuid && normalVm(vm)) { "This object cannot be managed as a VM." }
+        val power = vm.text("power_state")
+        val boot = recordOrNull("VM_metrics", vm.text("metrics"))?.text("start_time")?.takeIf { it.isNotBlank() }
+        val resident = vm.text("resident_on").takeIf { power != "Halted" && !isNull(it) }?.let { record("host", it) }
+        return VmDetails(authority, uuid, vm.text("name_label"), vm.text("name_description"), power, resident?.text("name_label"),
+            vm.number("VCPUs_max").toInt(), vm.number("memory_static_max"), emptyList(), emptyList(), false, null, emptyList(),
+            boot, vm.strings("allowed_operations").toSet(), busy(vm), clock(),
+            residentHostUuid = resident?.text("uuid")?.takeIf { it.isNotBlank() })
+    }
+    // --- end journaled operation hardening ---
+    // --- VM settings ---
+    /**
+     * The pool record (identity, HA, pool auto power-on), then the VM record, its metrics (live vCPU count), its guest
+     * metrics (vCPU hot-plug report) and host memory. Only `*.get_*` reads. Null only on UUID_INVALID for the VM.
+     */
+    override suspend fun settings(authority: String, uuid: String): VmSettings? {
+        val pool = poolRecord(authority)
+        val ref = refByUuid("VM", uuid) ?: return null
+        val vm = record("VM", ref)
+        require(vm["uuid"] == uuid && normalVm(vm)) { "This object cannot be managed as a VM." }
+        fun count(key: String) = vm.text(key).toLongOrNull() ?: throw GatewayError("invalid-record")
+        fun stringMap(value: Any?) = (value as? Map<*, *>)?.entries?.associate { (key, item) -> key.toString() to item?.toString().orEmpty() }.orEmpty()
+        val power = vm.text("power_state")
+        val metrics = recordOrNull("VM_metrics", vm.text("metrics"))
+        val guest = recordOrNull("VM_guest_metrics", vm.text("guest_metrics"))
+        val resident = vm.text("resident_on").takeIf { power != "Halted" && !isNull(it) }
+        val free = if (resident != null) recordOrNull("host", resident)?.let { recordOrNull("host_metrics", it.text("metrics")) }?.text("memory_free")?.toLongOrNull()
+            else records("host_metrics").values.filter { it.flag("live") }.mapNotNull { it.text("memory_free").toLongOrNull() }.maxOrNull()
+        val hotplug = stringMap(guest?.get("other"))["feature-vcpu-hotplug"]?.let { it == "1" }
+        return VmSettings(authority, uuid, vm.text("name_label"), vm.text("name_description"), vm.strings("tags"), power,
+            vm.strings("allowed_operations").toSet(), busy(vm), count("VCPUs_max"), count("VCPUs_at_startup"),
+            metrics?.text("VCPUs_number")?.toLongOrNull()?.takeIf { power == "Running" },
+            count("memory_static_min"), count("memory_dynamic_min"), count("memory_dynamic_max"), count("memory_static_max"),
+            stringMap(vm["other_config"])["auto_poweron"], stringMap(pool["other_config"])["auto_poweron"] == "true",
+            vm.text("HVM_boot_policy").isNotBlank(), VmInfoMapper.firmware(vm), stringMap(vm["HVM_boot_params"]),
+            pool.flag("ha_enabled"), vm.text("ha_restart_priority"), free, resident != null, hotplug, clock())
+    }
+    /** One setter, once. Pool and VM identity are read first ([NotSent] on any failure); the call itself is a write. */
+    override suspend fun submitSetting(authority: String, uuid: String, step: SettingStep) {
+        val ref = beforeSend("VM") {
+            verifyPool(authority)
+            val ref = refByUuid("VM", uuid) ?: throw NotSent("The VM no longer exists.")
+            val vm = record("VM", ref)
+            if (vm["uuid"] != uuid || !normalVm(vm)) throw NotSent("This object cannot be managed as a VM.")
+            ref
+        }
+        call(step.kind.xapiMethod, listOf(token) + SettingsRules.xapiArguments(step, ref))
+    }
+    // --- end VM settings ---
     override suspend fun taskUuid(reference: String): String = callForText("task.get_uuid", listOf(token, reference))
     override suspend fun taskReference(uuid: String): String = callForText("task.get_by_uuid", listOf(token, uuid))
     override suspend fun observeTask(reference: String): TaskObservation {
         val task = record("task", reference)
         // --- A2 operations --- A failed task's first error_info element is shown only if it is a well-formed code.
         val code = (task["error_info"] as? List<*>)?.firstOrNull()?.toString()?.takeIf { it.matches(Regex("[A-Z0-9_]{1,64}")) }
-        return TaskObservation(task.text("status"), task["progress"]?.toString()?.toDoubleOrNull() ?: 0.0, code)
+        return TaskObservation(task.text("status"), task["progress"]?.toString()?.toDoubleOrNull()?.takeIf { it.isFinite() } ?: 0.0, code)
     }
 
     // --- A4 alerts/events ---
-    private fun recordMap(value: Any?): Map<String, Map<String, Any?>> {
-        val data = value as? Map<*, *> ?: throw GatewayError("invalid-records")
-        return data.entries.associate { entry -> (entry.key as? String ?: throw GatewayError("invalid-record-key")) to map(entry.value) }
-    }
-    private fun messagesSince(millis: Long) = recordMap(call("message.get_since", listOf(token, XmlRpcDateTime(millis))))
     /**
      * Full read: `message.get_all_records`. A very large message store can exceed the parser's size/complexity
      * limits; then only the recent window is requested and the result is marked truncated. Incremental read:
@@ -708,17 +973,9 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
      */
     fun alerts(authority: String, sinceMillis: Long?): AlertFetch {
         verifyPool(authority)
-        var full = sinceMillis == null
-        var truncated = false
-        val records = if (sinceMillis != null) messagesSince(sinceMillis) else try { records("message") } catch (error: Exception) {
-            val tooLarge = error is IllegalArgumentException && error.message.orEmpty().startsWith("Response ") ||
-                error is GatewayError && error.reason == "response-limit"
-            if (!tooLarge) throw error
-            full = false; truncated = true
-            messagesSince(clock() - AlertMerge.FALLBACK_WINDOW_MILLIS)
-        }
+        val window = messageWindow(sinceMillis) // inventory scale: shared with pool activity
         verifyPool(authority)
-        return AlertFetch(authority, clock(), AlertMapper.parse(records), full, truncated)
+        return AlertFetch(authority, clock(), AlertMapper.parse(window.read.records), window.full, window.truncated)
     }
     /**
      * `message.destroy` for each target, each followed by `message.get_record`: HANDLE_INVALID is the only proof
@@ -770,9 +1027,22 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
         val pool = pools.values.single()
         return pool.text("uuid").also { require(it.isNotBlank()) { "Missing pool identity." } } to pool
     }
-    /** Pool, then A4's incremental alert read (pool checked before and after), then a bounded set of object names. */
-    fun backgroundAlerts(sinceMillis: Long, wanted: (AlertMessage) -> Boolean): BackgroundAlertFetch {
+    /**
+     * The server's clock from `host.get_servertime` on the pool master, paired with the phone's clock halfway through the call.
+     * Null when the server does not answer it (the read is optional: only a first check or another pool needs it).
+     */
+    private fun serverClock(master: String): ServerClock? {
+        val ref = liveRef(master) ?: return null
+        val before = clock()
+        val text = optionalText("host.get_servertime", listOf(token, ref)) ?: return null
+        val after = clock()
+        return ActivityMapper.time(text)?.let { ServerClock(it, before + (after - before) / 2) }
+    }
+    /** Pool, the server's clock, then A4's incremental alert read (pool checked before and after), then a bounded set of object names. */
+    fun backgroundAlerts(since: BackgroundSince, wanted: (AlertMessage) -> Boolean): BackgroundAlertFetch {
         val (authority, pool) = singlePool()
+        val serverClock = serverClock(pool.text("master"))
+        val sinceMillis = since.since(authority, serverClock) ?: throw ServerTimeUnavailable()
         val fetch = alerts(authority, sinceMillis)
         val names = LinkedHashMap<String, String>()
         fetch.messages.filter(wanted).map { it.objectKind to it }.distinctBy { BackgroundAlerts.objectKey(it.second) }
@@ -783,15 +1053,24 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
                 val ref = optionalText("$type.get_by_uuid", listOf(token, message.objectUuid)) ?: return@forEach
                 optionalText("$type.get_name_label", listOf(token, ref))?.let { names[BackgroundAlerts.objectKey(message)] = it.take(80) }
             }
-        return BackgroundAlertFetch(authority, pool.text("name_label").ifBlank { "XCP-ng pool" }, fetch.messages, names)
+        return BackgroundAlertFetch(authority, pool.text("name_label").ifBlank { "XCP-ng pool" }, fetch.messages, names, serverClock)
     }
     /** Pool, hosts, host metrics, non-template VMs and the unread urgent alerts count, in one session. */
     fun poolSummary(lastSeen: Long?): PoolSummaryRead {
         val pools = records("pool")
         val (authority, _) = singlePool(pools)
-        val hosts = records("host")
-        val metrics = records("host_metrics")
-        val vms = recordMap(call("VM.get_all_records_where", listOf(token, PoolSummaries.VM_FILTER)))
+        // inventory scale: projected hosts, and the VMs are counted as they stream (nothing per VM is kept)
+        val hosts = projected("host", Projections.HOST).records
+        val metrics = projected("host_metrics", Projections.HOST_METRICS).records
+        var vmsTotal = 0
+        var vmsRunning = 0
+        streamCall("VM.get_all_records_where", listOf(token, PoolSummaries.VM_FILTER)) { input ->
+            XmlRpcRecordStream(input, limits).read(Projections.GUEST) { _, vm, _ ->
+                if (!vm.flag("is_a_template") && !vm.flag("is_control_domain") && !vm.flag("is_a_snapshot")) {
+                    vmsTotal++; if (vm.text("power_state") == "Running") vmsRunning++
+                }
+            }
+        }
         var partial = false
         val unread = try {
             val fetch = alerts(authority, lastSeen)
@@ -799,7 +1078,7 @@ private class XapiSession(private val profile: Profile, private val clock: () ->
             PoolSummaries.unread(fetch.messages, lastSeen)
         } catch (error: RpcFailure) { if (error.code == "SESSION_AUTHENTICATION_FAILED") throw error else null }
         catch (_: GatewayError) { null }
-        return PoolSummaries.counts(pools, hosts, metrics, vms, unread, partial, clock())
+        return PoolSummaries.counts(pools, hosts, metrics, emptyMap(), unread, partial, clock()).copy(vmsRunning = vmsRunning, vmsTotal = vmsTotal)
     }
     /**
      * Read-only update availability. The plugin call can take a while (it queries the host's package repositories),
@@ -827,6 +1106,10 @@ internal class CallAbort {
         if (aborted) { value.disconnect(); throw GatewayError("aborted") }
     }
     fun abort() { aborted = true; connection?.disconnect() }
+    // --- session reuse --- a finished connection may be pooled, so a later abort must not touch it
+    val isAborted get() = aborted
+    fun detach(value: HttpsURLConnection) { if (connection === value) connection = null }
+    // --- end session reuse ---
 }
 
 private class XapiEventSession(private val connection: XapiSession, private val marginMillis: Long) : EventSession {
@@ -851,9 +1134,7 @@ private class XapiEventSession(private val connection: XapiSession, private val 
 // --- end A4 ---
 
 // --- B2 storage/host --- read bounds
-private const val MAX_SNAPSHOTS = 100
-private const val MAX_BLOCKERS = 50
-private const val MAX_PBDS = 200
+// inventory scale: snapshots, blockers and PBDs are no longer cut here (see METEOR-LIVE-FINDINGS.md, finding 3)
 private const val MAX_ISOS = 200
 // --- end B2 storage/host ---
 private fun Map<String, Any?>.text(key: String) = this[key]?.toString().orEmpty()

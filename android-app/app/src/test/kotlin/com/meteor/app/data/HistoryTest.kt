@@ -24,13 +24,22 @@ class HistoryTest {
         assertEquals(listOf(600L to 5L, 7_200L to 60L, 604_800L to 3_600L), HistoryRange.entries.map { it.spanSeconds to it.stepSeconds })
         assertEquals(listOf("10 minutes", "2 hours", "1 week"), HistoryRange.entries.map { it.label })
     }
-    @Test fun queryStartIsAlignedDownToTheStepAndUsesTheRangeAsInterval() {
+    @Test fun queryStartIsTwoStepsInsideTheSpanAndUsesTheRangeAsInterval() {
         val now = 1_700_000_123L
-        assertEquals(HistoryQuery(1_699_999_520, 5), HistoryRange.TEN_MINUTES.query(now))
-        assertEquals(HistoryQuery(1_699_992_900, 60), HistoryRange.TWO_HOURS.query(now))
-        assertEquals(HistoryQuery(1_699_394_400, 3_600), HistoryRange.ONE_WEEK.query(now))
+        // alignDown(now) - span + 2 steps; the server answers from the finest archive only when start is inside it.
+        assertEquals(HistoryQuery(1_699_999_530, 5), HistoryRange.TEN_MINUTES.query(now))
+        assertEquals(HistoryQuery(1_699_993_020, 60), HistoryRange.TWO_HOURS.query(now))
+        assertEquals(HistoryQuery(1_699_401_600, 3_600), HistoryRange.ONE_WEEK.query(now))
         HistoryRange.entries.forEach { assertEquals(0L, it.query(now).startSeconds % it.stepSeconds) }
         assertEquals(0L, HistoryRange.ONE_WEEK.query(100).startSeconds)
+    }
+    @Test fun theStartNeverLiesBeforeTheFinestArchiveForAnyPhaseOfTheStep() {
+        // The archives hold exactly span/step rows ending at alignDown(now); a start older than the oldest row falls to the coarser archive.
+        for (range in HistoryRange.entries) for (now in 1_700_000_000L..1_700_000_000L + 2 * range.stepSeconds step maxOf(1L, range.stepSeconds / 7)) {
+            val oldestRow = now / range.stepSeconds * range.stepSeconds - (range.spanSeconds / range.stepSeconds - 1) * range.stepSeconds
+            assertTrue("$range $now", range.query(now).startSeconds >= oldestRow + range.stepSeconds)
+            assertTrue("$range $now bounded", now - range.query(now).startSeconds <= range.spanSeconds)
+        }
     }
     @Test fun incrementalQueriesRestartTwoStepsBeforeTheNewestRowButNeverBeforeTheWindow() {
         val now = 1_700_000_123L
@@ -100,6 +109,25 @@ class HistoryTest {
         assertEquals(listOf("The server returned no history for this VM."), vm().notes)
         assertTrue(runCatching { vm("cpu0" to listOf(1.0, 1.0, 1.0), "cpu0" to listOf(2.0, 2.0, 2.0)) }.isFailure)
     }
+    @Test fun theAggregateNicIsNotANicAndGetsAnAllNicsCardOnlyWhenThereAreSeveralNics() {
+        val rate = listOf(1.0, 2.0, 3.0)
+        val one = host("pif_eth0_rx" to rate, "pif_eth0_tx" to rate, "pif_aggr_rx" to rate, "pif_aggr_tx" to rate)
+        assertEquals(listOf("NIC eth0"), one.series.map { it.card }.distinct())
+        val two = host("pif_aggr_rx" to rate, "pif_aggr_tx" to rate, "pif_eth1_rx" to rate, "pif_eth1_tx" to rate, "pif_eth0_rx" to rate, "pif_eth0_tx" to rate)
+        assertEquals(listOf("All NICs", "NIC eth0", "NIC eth1"), two.series.map { it.card }.distinct())
+        assertEquals(listOf("pif_aggr_rx", "pif_aggr_tx"), two.series.filter { it.card == "All NICs" }.map { it.id })
+        assertEquals(listOf("Receive", "Transmit"), two.series.filter { it.card == "All NICs" }.map { it.label })
+        assertTrue("only the aggregate: nothing to add up", host("pif_aggr_rx" to rate, "pif_aggr_tx" to rate).series.isEmpty())
+    }
+    @Test fun diskCardsKeepOnlyTheDevicesTheVmListsAsDisks() {
+        val rate = listOf(1.0, 1.0, 1.0)
+        val columns = listOf("xvda", "xvdd", "xvde").flatMap { listOf("vbd_${it}_read" to rate, "vbd_${it}_write" to rate) }.toTypedArray()
+        val update = update("vm", "vm-1", *columns)
+        fun cards(disks: Set<String>?) = HistoryMapper.build(vmTarget, HistoryRange.TEN_MINUTES, update, 1, 1, disks).series.map { it.card }.distinct()
+        assertEquals(listOf("Disk xvda"), cards(setOf("xvda")))
+        assertEquals(listOf("Disk xvda", "Disk xvdd", "Disk xvde"), cards(null))
+        assertEquals(emptyList<String>(), cards(emptySet()))
+    }
     @Test fun vifAndDiskCardsAreCapped() {
         val vifs = (0..7).flatMap { listOf("vif_${it}_rx" to listOf(1.0, 1.0, 1.0)) }
         assertEquals(HistoryMapper.MAX_VIF_CARDS, vm(*vifs.toTypedArray()).series.size)
@@ -136,11 +164,26 @@ class HistoryTest {
         assertTrue("a series absent from a newer row is missing there, not carried forward", gone.values.takeLast(2).all { it.isNaN() })
         merged.series.forEach { assertEquals(merged.timestamps.size, it.values.size) }
     }
-    @Test fun mergeStartsOverWhenTheTargetRangeOrStepChangesAndKeepsHistoryOnAnEmptyDelta() {
+    @Test fun mergeKeepsTheEarlierRowsWhenTheServerAnswersWithAnotherStep() {
+        val coarse = snap(listOf(0, 60, 120), "a" to listOf(1.0, 2.0, 3.0)).copy(stepSeconds = 60)
+        val fine = snap(listOf(125, 130, 135), "a" to listOf(4.0, 5.0, 6.0), observedAt = 9)
+        val merged = HistoryWindow.merge(coarse, fine)
+        assertEquals(listOf(0L, 60L, 120L, 125L, 130L, 135L), merged.timestamps)
+        assertEquals(listOf(1.0, 2.0, 3.0, 4.0, 5.0, 6.0), merged.series.single().values)
+        assertEquals("the coarse rows are 60 s apart, so the window keeps the coarse step for its gap rule", 60L, merged.stepSeconds)
+        assertEquals(9L, merged.observedAt)
+        // Once the coarse rows have aged out of the span, the window is on the finer step again.
+        val later = HistoryWindow.merge(merged, snap(listOf(800, 805), "a" to listOf(7.0, 8.0)))
+        assertEquals(listOf(800L, 805L), later.timestamps); assertEquals(5L, later.stepSeconds)
+        // And the other way round: fine rows first, then a coarser read adds its rows without dropping the fine ones.
+        val back = HistoryWindow.merge(fine, snap(listOf(180), "a" to listOf(9.0)).copy(stepSeconds = 60))
+        assertEquals(listOf(125L, 130L, 135L, 180L), back.timestamps); assertEquals(60L, back.stepSeconds)
+    }
+    @Test fun mergeStartsOverWhenTheTargetOrRangeChangesAndKeepsHistoryOnAnEmptyDelta() {
         val old = snap(listOf(0, 5), "a" to listOf(1.0, 2.0))
         val next = snap(listOf(10), "a" to listOf(3.0))
         assertSame(next, HistoryWindow.merge(null, next))
-        for (other in listOf(next.copy(target = vmTarget), next.copy(range = HistoryRange.TWO_HOURS), next.copy(stepSeconds = 60)))
+        for (other in listOf(next.copy(target = vmTarget), next.copy(range = HistoryRange.TWO_HOURS)))
             assertSame(other, HistoryWindow.merge(old, other))
         val empty = HistoryWindow.merge(old, snap(emptyList(), "a" to emptyList(), observedAt = 77))
         assertEquals(old.timestamps, empty.timestamps); assertEquals(old.series, empty.series); assertEquals(77L, empty.observedAt)
@@ -189,11 +232,35 @@ class HistoryTest {
         val l = Locale.ROOT
         assertEquals("25.6%", HistoryFormat.value(.256, HistoryUnit.FRACTION, l))
         assertEquals("0.42", HistoryFormat.value(.42, HistoryUnit.LOAD, l))
-        assertEquals("1.5 GiB", HistoryFormat.value(1.5 * 1024 * 1024 * 1024, HistoryUnit.BYTES, l))
+        assertEquals("1.50 GiB", HistoryFormat.value(1.5 * 1024 * 1024 * 1024, HistoryUnit.BYTES, l))
         assertEquals("512 B", HistoryFormat.value(512.0, HistoryUnit.BYTES, l))
-        assertEquals("2.0 KiB/s", HistoryFormat.value(2048.0, HistoryUnit.BYTES_PER_SECOND, l))
+        assertEquals("2.00 KiB/s", HistoryFormat.value(2048.0, HistoryUnit.BYTES_PER_SECOND, l))
         assertEquals("No data", HistoryFormat.value(nan, HistoryUnit.FRACTION, l))
         assertEquals("No data", HistoryFormat.value(Double.POSITIVE_INFINITY, HistoryUnit.BYTES, l))
-        assertEquals("3.0 TiB", HistoryFormat.size(3L * 1024 * 1024 * 1024 * 1024, l))
+        assertEquals("3.00 TiB", HistoryFormat.size(3L * 1024 * 1024 * 1024 * 1024, l))
+    }
+
+    // ---- a window wider than the data (the week chart of a server that was up for hours) ----
+
+    @Test fun aChartSaysWhenTheServerRecordedNothingForTheFirstPartOfTheWindow() {
+        val nan = Double.NaN
+        val hour = 3600L; val week = (0 until 168).map { it * hour }
+        // Up for the last six hours of a week: values only at the end.
+        val upSixHours = week.indices.map { if (it >= 162) 1.0 + it else nan }
+        assertEquals(week[162], HistoryChartMath.dataStartsLate(week, listOf(upSixHours), hour))
+        // Any series with an earlier value moves the start earlier.
+        val earlier = week.indices.map { if (it >= 100) 2.0 else nan }
+        assertEquals(week[100], HistoryChartMath.dataStartsLate(week, listOf(upSixHours, earlier), hour))
+        // Data from the start, or only a short hole at the start (two steps, or under a twentieth of the window), is not worth a note.
+        assertNull(HistoryChartMath.dataStartsLate(week, listOf(week.map { 1.0 }), hour))
+        assertNull(HistoryChartMath.dataStartsLate(week, listOf(week.indices.map { if (it >= 2) 1.0 else nan }), hour))
+        assertNull(HistoryChartMath.dataStartsLate(week, listOf(week.indices.map { if (it >= 8) 1.0 else nan }), hour))
+        assertEquals(week[9], HistoryChartMath.dataStartsLate(week, listOf(week.indices.map { if (it >= 9) 1.0 else nan }), hour))
+        // No data at all, or too few points, says nothing here (the card already says "No data in this window").
+        assertNull(HistoryChartMath.dataStartsLate(week, listOf(week.map { nan }), hour))
+        assertNull(HistoryChartMath.dataStartsLate(listOf(0L), listOf(listOf(1.0)), hour))
+        assertNull(HistoryChartMath.dataStartsLate(week, emptyList(), hour))
+        // The line itself covers only the last part: one run, from the first value, drawn as it always was.
+        assertEquals(listOf(162..167), HistoryChartMath.runs(week, upSixHours, hour))
     }
 }

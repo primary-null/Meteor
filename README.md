@@ -1,8 +1,8 @@
 # Meteor
 
-**A native Android client for XCP-ng.** Meteor connects directly to a pool's XAPI over certificate-pinned HTTPS and shows hosts, virtual machines, storage, networks and alerts on your phone. You can run VM, snapshot, host and storage operations, open a VM console and follow performance history, and every operation goes through a write-ahead journal that never repeats a command it cannot verify.
+**A native Android client for XCP-ng.** Meteor connects directly to a pool's XAPI over certificate-pinned HTTPS and shows hosts, virtual machines, storage, networks and alerts on your phone. You can run VM, snapshot, host and storage operations, edit a VM's settings, open a VM's or a host's console and follow performance history, and every change goes through a write-ahead journal that never repeats a command it cannot verify.
 
-> **Status:** in active development (1.10). Direct XAPI inventory, VM and host operations, snapshots, ISO media, storage repair, the VM console, performance history, alerts and optional background alert notifications are implemented and covered by offline tests; live-server acceptance on XCP-ng 8.3 remains separate. Xen Orchestra connections are planned but not implemented. Meteor is not on an app store; signed APKs, once published, are distributed through [GitHub Releases](https://github.com/primary-null/Meteor/releases) and early builds are marked *Pre-release* there.
+> **Status:** in active development (1.11). Direct XAPI inventory, VM and host operations, VM settings, snapshots, ISO media, storage repair, the VM and host consoles, performance history, alerts and optional background alert notifications are implemented and covered by offline tests. The parsers and decoders are also tested against recordings of a real XCP-ng 8.3 host, and inventory, the VM console, performance, alerts and a settings edit have been run on a phone against that host. Snapshots, migration, host maintenance, storage repair and input to a host console have not been run against a live server yet. Xen Orchestra connections are planned but not implemented. Meteor is not on an app store; signed APKs, once published, are distributed through [GitHub Releases](https://github.com/primary-null/Meteor/releases) and early builds are marked *Pre-release* there.
 
 <p align="center">
   <img src="design/assets/silver-hybrid.png" alt="Meteor icon artwork" width="160">
@@ -13,7 +13,7 @@
 **No signed APK has been published yet.** Once the first release is signed and published, its APK will appear on the **[Releases page](https://github.com/primary-null/Meteor/releases)**. Meteor needs Android 12 (API 31) or newer.
 
 1. On your phone, open the [Releases page](https://github.com/primary-null/Meteor/releases) and the newest release.
-2. Under **Assets**, download `Meteor-<version>.apk` (for example `Meteor-1.10.apk`). Ignore *Source code (zip)* and *(tar.gz)*: they are not installable. The GitHub Actions run artifacts are build output for developers and need a signed-in GitHub account.
+2. Under **Assets**, download `Meteor-<version>.apk` (for example `Meteor-1.11.apk`). Ignore *Source code (zip)* and *(tar.gz)*: they are not installable. The GitHub Actions run artifacts are build output for developers and need a signed-in GitHub account.
 3. Open the downloaded file. When Android asks, allow your browser or file manager to **install unknown apps**, then tap **Install**. You can switch that permission off again afterwards (Settings, Apps, Special app access, Install unknown apps).
 4. Open Meteor and follow [Using it](#using-it).
 
@@ -34,22 +34,23 @@ Maintainers: [docs/RELEASING.md](docs/RELEASING.md).
 
 ## Features
 
-- **VM operations.** Start, shut down and reboot (graceful or forced), suspend and resume, pause and unpause, start on a chosen host, and live-migrate within the pool. Each action is offered only when the server allows it, confirms against freshly read state, and disruptive kinds require typing the VM's name. Actions keep a stable position on screen; inapplicable ones are disabled with a reason.
+- **VM operations.** Start, shut down and reboot (graceful or forced), suspend and resume, pause and unpause, start on a chosen host, and live-migrate within the pool. Each action is offered only when the server allows it, confirms against freshly read state, and disruptive kinds require typing the VM's name. Actions keep a stable position on screen; inapplicable ones are disabled with a reason. A submitted operation is watched for as long as its kind realistically takes, from two minutes to an hour for a host evacuation. The rest of the app stays usable meanwhile, and **Stop watching** leaves the record pending without cancelling or resending anything.
+- **VM settings.** Edit a VM's name, description, tags, vCPUs, memory limits, start with the host, boot order and HA restart priority. Each change is offered only in the power state the server accepts it in, shows exactly what will change before sending, and is proven by reading the value back. Lowering vCPUs or memory on a running VM requires typing its name.
 - **Snapshots and media.** Take, revert and delete snapshots, and insert or eject ISO images in a VM's virtual CD drive. Snapshot deletion journals each sub-step, so an interrupted delete is never repeated blindly.
 - **Host and storage maintenance.** Disable a host for maintenance, evacuate it and enable it again. Host reboot and shutdown are offered only when the host is disabled and runs no VMs. Repair a storage repository whose connections are unplugged. A manual, read-only check shows available host updates.
-- **Console.** A full-screen VM console over the same pinned connection, with compressed encodings, pinch zoom, a special-key bar, keyboard and pointer input, and a view-only mode. Consoles on pool member hosts require their own certificate review.
-- **Performance history.** VM and host charts for the last 10 minutes, 2 hours or week from the server's recorded history, plus live samples while the page is visible. Missing or unrecorded sources remain unavailable; declared units and guest-memory semantics are preserved. No recording settings are changed.
+- **Console.** Tap a running VM to open its full-screen console over the same pinned connection, with compressed encodings, pinch zoom, a special-key bar with hold-to-repeat, keyboard, touch and mouse input, paste as key presses, automatic reconnect after a lost link, and a view-only mode. A host's own console opens from the host's details: it starts view-only every time, asks once before input is sent to the hypervisor, and never offers Ctrl+Alt+Del. Consoles on pool member hosts require their own certificate review.
+- **Performance history.** VM and host charts for the last 10 minutes, 2 hours or week from the server's recorded history, plus live readings of CPU, memory, disk and network from a fixed set of enabled sources while the page is visible. Missing or unrecorded sources remain unavailable; declared units and guest-memory semantics are preserved. No recording settings are changed.
 - **Alerts.** An inbox of the pool's alerts with an unread badge, readable alarm summaries and confirmed dismissal. It refreshes from server events while the app is open, and follows a pool master change only after you review the new master's certificate.
-- **Background alerts (opt-in).** Periodic, read-only alert checks through Android's WorkManager (at most every 15 minutes, only on a network and when the battery is not low), with notifications and an All pools summary on Overview. No foreground service.
+- **Background alerts (opt-in).** Periodic, read-only alert checks through Android's WorkManager (at most every 15 minutes, only on a network), with notifications and an All pools summary on Overview. Settings shows when each connection was last checked and what happened, alerts are compared in the server's time, and a notification clears when its alert is seen or dismissed in the app. No foreground service.
 - **Pool activity.** Inspect the tasks and alerts currently retained by the server, including other clients. Each section handles limited permissions independently. Alert details start collapsed. Progress is an estimate, server task status does not prove a VM power outcome, and the snapshot is not a complete audit log.
 - **Operational detail.** Inspect host memory, software version and resident VMs, per-repository storage type and capacity, and a read-only Networks view, from the current pool snapshot.
 - **Foldables and tablets.** System Back works throughout. Medium and expanded widths get a navigation rail and side-by-side list and details, and the current screen survives folding and unfolding.
 - **Action history.** Browse retained operations in Settings. Verified success, failure, uncertainty and manual closure remain visibly distinct. A slow history reload cannot overwrite newer action state.
-- **Find your fleet.** Search by VM or host name, filter by power state, see matching counts, and clear filters in one tap. The last-known view stays visibly separate from a fresh connection.
+- **Find your fleet.** Search by VM or host name, filter by power state, see matching counts, and clear filters in one tap. The inventory reads only real VMs as a stream, so pools of thousands of VMs load, and a list that is shortened says so. The last-known view stays visibly separate from a fresh connection.
 - **A quieter header.** Fourteen ambient messages change automatically after 90 seconds on an idle Overview, at most twice per session. No playback controls or continuous rotation.
-- **Direct XAPI connection.** Connect to the pool coordinator with no extra server or agent to install.
+- **Direct XAPI connection.** Connect to the pool coordinator with no extra server or agent to install. Automatic reconnects back off, stop after rejected credentials or a changed certificate until you act, and an offline phone is shown as offline rather than as a server error.
 - **Trust you can review.** Before sending any credentials, Meteor shows the server certificate's SHA-256 fingerprint so you can compare it. Accepting it pins that exact certificate.
-- **Manage saved connections.** Rename profiles offline, replace credentials, inspect saved pins, explicitly disconnect, or forget a profile from this device. Certificate review shows validity dates and compares the observed fingerprint with the saved identity. An unresolved action protects its original profile from removal.
+- **Manage saved connections.** Rename profiles offline, replace credentials, inspect saved pins, explicitly disconnect, or forget a profile from this device. Certificate review shows validity dates and compares the observed fingerprint with the saved identity. An unresolved action protects its original profile from removal. If the saved connections cannot be opened, Connect explains why and offers a retry or a fresh start that never touches the action history.
 - **Fleet overview.** See pool, host, VM and storage capacity at a glance, with VMs grouped by the host they run on (or *Unassigned* when halted).
 - **VM details.** View disks, network interfaces, snapshots, the CD drive, guest-tools status, OS and guest addresses (hidden until you ask to see them), last boot time and the operations the server currently allows.
 - **Make it yours.** Light, dark or system mode, four accent colours, an optional orbital texture, and a custom icon per VM that stays with the VM's identity as it migrates.
@@ -64,9 +65,9 @@ XCP-ng hosts usually serve self-signed certificates, so Meteor replaces CA trust
 
 - Certificate inspection completes a TLS handshake and reads the leaf certificate **without sending credentials**.
 - Every later request requires the exact SHA-256 pin, a currently valid certificate and the expected hostname. A changed certificate fails with a distinct `CertificateChanged` error, so the UI can ask you to verify again rather than reporting a generic failure.
-- Redirects are refused, responses are capped at 8 MiB, and only `https://host[:port]/` endpoints without paths, queries or embedded credentials are accepted. Cleartext traffic is disabled for the whole app.
+- Redirects are refused, responses are capped at 8 MiB (the inventory's VM list is instead parsed as a stream, with its own limits sized from real record costs), and only `https://host[:port]/` endpoints without paths, queries or embedded credentials are accepted. Cleartext traffic is disabled for the whole app.
 - The XML-RPC parser (`XmlRpc.kt`) rejects DTDs and entities, limits nesting depth and node count, rejects duplicate struct fields, and turns XAPI failures into error codes without echoing server-supplied arguments.
-- Each operation runs in a short-lived session. Once login has returned a session, Meteor attempts `session.logout` in a `finally` block, including when a later response is malformed. Logout is best-effort, and a failed logout is ignored.
+- Foreground calls share one XAPI session per connected profile (`SessionReuse.kt`), bound to that profile's endpoint, username, password and pin, and logged out on disconnect, on any identity change and after two minutes in the background. A read answered `SESSION_INVALID` logs in once and is repeated once. A write is never repeated, never sent on a kept-alive connection, and not started if its caller was already cancelled. Background checks, the event long-poll and consoles keep their own sessions.
 
 ### Encrypted connection profiles
 
@@ -80,7 +81,7 @@ Profiles (endpoint, username, password and pin) are stored in a single **AES-256
 
 ### Journaled operations with safe uncertain-outcome handling
 
-Every state-changing operation (VM power and placement, snapshots, CD media, host maintenance and storage repair) is designed around one rule: **a command whose outcome is unknown is never sent again automatically** (`Power.kt`, `VmOperations.kt`, `TargetOperations.kt`, `OperationJournal.kt`).
+Every state-changing operation (VM power and placement, VM settings, snapshots, CD media, host maintenance and storage repair) is designed around one rule: **a command whose outcome is unknown is never sent again automatically** (`Power.kt`, `VmOperations.kt`, `TargetOperations.kt`, `OperationJournal.kt`).
 
 1. **Confirm against fresh state.** Pressing an action re-reads the VM. The confirmation expires after 30 seconds and is rejected if the connection, pool, VM, power state or boot time changed in the meantime.
 2. **Write ahead.** The operation is journaled as `PREPARED`, then `SUBMITTING`, *before* the request leaves the device. A single process-wide lock and a "no unresolved operation" check prevent concurrent or duplicate sends.
@@ -90,7 +91,9 @@ Every state-changing operation (VM power and placement, snapshots, CD media, hos
 6. **Recover by observing only.** *Check status* re-reads the original pool and VM through the original trusted connection and resumes watching the saved task. Recovery code has no path to `submit`.
 7. **Manual review as a last resort.** If the task can't be found, you can review the record. Meteor reads the original VM again, refuses while any VM operation is active, asks you to confirm that you checked the server's task history, and re-reads once more before closing. The closed record keeps the original action and its **unverified** outcome. It is never reported as a success.
 
-While an operation is unresolved, new operations stay locked, but connections can still be repaired or added so you can investigate. Journal and profile documents remain version 1 and only gained optional keys, so data from earlier releases loads unchanged; an older build that meets an operation kind it does not know keeps it locked instead of discarding it.
+VM settings use synchronous calls that return no task, so each setter is its own journaled step: the value is read just before sending, the single call is sent, and success is the requested value read back (`VmSettings.kt`). A lost reply is never resent. Only error codes the server raises before it writes anything count as a definite rejection; everything else is decided by the read-back.
+
+While an operation is unresolved, new operations stay locked, but connections can still be repaired or added so you can investigate. A record whose VM was deleted on the server, or that an older build cannot interpret, can be closed after manual review instead of locking the app. Journal and profile documents remain version 1 and only gained optional keys, so data from earlier releases loads unchanged; an older build that meets an operation kind it does not know keeps it locked instead of discarding it.
 
 ### Responsive and race-safe UI
 
@@ -106,7 +109,7 @@ While an operation is unresolved, new operations stay locked, but connections ca
 
 `ObservabilityController` fences requests by profile, connection origin, pool, object and generation. Switching connection/pool or disconnecting clears observations; read failures mark displayed data as last known. `MetricWindow` bounds memory, preserves gaps and resets on clock rollback or target change. The active page polls only while the app is visible.
 
-The gateway uses XAPI's [VM](https://xapi-project.github.io/xen-api/classes/vm.html) and [host](https://xapi-project.github.io/xen-api/classes/host.html) `get_data_sources`, plus read-only [task](https://xapi-project.github.io/xen-api/classes/task.html) and [message](https://xapi-project.github.io/xen-api/classes/message.html) snapshots through the same pinned HTTPS sessions. History comes from `/rrd_updates` (XML or JSON) through `PinnedHttp`, which applies the same pin, hostname, redirect and size rules as XML-RPC. That URL carries a session reference, so errors never include it. Task results, backtraces and error arguments are excluded, and no task cancellation is offered. Alert refresh uses `event.from` on a separate foreground session, and dismissal is confirmed by reading the alert back.
+The gateway uses XAPI's [VM](https://xapi-project.github.io/xen-api/classes/vm.html) and [host](https://xapi-project.github.io/xen-api/classes/host.html) `get_data_sources` as a catalogue and `query_data_source` for current values (a real server reports no values in the catalogue), plus read-only [task](https://xapi-project.github.io/xen-api/classes/task.html) and [message](https://xapi-project.github.io/xen-api/classes/message.html) snapshots through the same pinned HTTPS sessions. History comes from `/rrd_updates` (XML or JSON) through `PinnedHttp`, which applies the same pin, hostname, redirect and size rules as XML-RPC. That URL carries a session reference, so errors never include it. Task results, backtraces and error arguments are excluded, and no task cancellation is offered. Alert refresh uses `event.from` on a separate foreground session, and dismissal is confirmed by reading the alert back.
 
 ### Executable reference model
 
@@ -126,7 +129,7 @@ Minimum Android 12 (API 31), target API 36.
 android-app/                Gradle project (single :app module)
   app/src/main/…/data/      Transport, XML-RPC, trust, vault, journal, power engine
   app/src/main/…/           Compose UI and ViewModel
-  app/src/test/             JVM unit tests, including a real loopback HTTPS/XAPI fixture
+  app/src/test/             JVM unit tests, a real loopback HTTPS/XAPI fixture, sanitized recordings of a real XCP-ng 8.3 host
   app/src/androidTest/      Offline instrumentation tests (vault, journal, UI journeys, races)
 meteor_logic/               Python reference model and its tests
 scripts/                    Repository checks: source guard, version helper and release signing/verification
@@ -171,7 +174,9 @@ Meteor is meant for private networks or a VPN. It does not expose any listening 
 
 ## Roadmap
 
-- Live-server acceptance of the 1.10 operations on XCP-ng 8.3
+- Live-server acceptance of snapshots, migration, host maintenance and storage repair on XCP-ng 8.3
+- Day-to-day parity with XCP-ng's own tools: create, clone and delete VMs, disks and network interfaces, then host, storage, network and pool administration
+- Fleet sorting and wider search, a problems-first overview and user-defined alert thresholds
 - Xen Orchestra (REST) connections alongside direct XAPI, for backups, restore and replication
 - Store packaging beyond GitHub Releases
 

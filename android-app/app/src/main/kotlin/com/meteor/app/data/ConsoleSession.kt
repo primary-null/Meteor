@@ -8,6 +8,7 @@ import java.net.URI
 import java.net.URISyntaxException
 import java.security.cert.X509Certificate
 import java.util.concurrent.atomic.AtomicBoolean
+import kotlinx.coroutines.currentCoroutineContext
 import javax.net.ssl.HostnameVerifier
 import javax.net.ssl.SSLSocket
 
@@ -50,7 +51,8 @@ class ConsoleSession internal constructor(private val socket: Socket, encodings:
          * Sends `CONNECT` with the XAPI session as a cookie and waits for the tunnel. When [sessionQuery] is
          * set the session is also added as a `session_id` query parameter, a form some XAPI builds expect.
          */
-        internal fun connect(socket: Socket, uri: URI, token: String, sessionQuery: Boolean = false, verify: () -> Boolean) {
+        internal fun connect(socket: Socket, uri: URI, token: String, sessionQuery: Boolean = false, subject: ConsoleSubject = ConsoleSubject.VM,
+            verify: () -> Boolean) {
             if (!verify()) throw ConsoleError("Console certificate does not match the saved pin.", ConsoleFailureKind.CERTIFICATE)
             if (!token.matches(Regex("[A-Za-z0-9:._-]+"))) throw ConsoleError("Invalid console session reference.", ConsoleFailureKind.AUTH)
             val host = uri.host + if (uri.port == -1) "" else ":${uri.port}"
@@ -69,8 +71,11 @@ class ConsoleSession internal constructor(private val socket: Socket, encodings:
             if (status.matches(Regex("HTTP/1\\.[01] 200(?: .*)?"))) return
             val code = Regex("HTTP/1\\.[01] (\\d{3})").find(status)?.groupValues?.get(1)?.toInt() ?: 0
             throw when (code) {
-                401, 403 -> ConnectRefused(code, "This account is not permitted to open this VM's console (HTTP $code).", ConsoleFailureKind.AUTH)
-                404 -> ConnectRefused(code, "The server has no console for this VM right now (HTTP 404).", ConsoleFailureKind.NO_CONSOLE)
+                401, 403 -> ConnectRefused(code, if (subject == ConsoleSubject.HOST)
+                    "The server refused this host's console to this account (HTTP $code). Its role may not allow host consoles."
+                    else "This account is not permitted to open this VM's console (HTTP $code).", ConsoleFailureKind.AUTH)
+                404 -> ConnectRefused(code, "The server has no console for ${if (subject == ConsoleSubject.HOST) "this host" else "this VM"} right now (HTTP 404).",
+                    ConsoleFailureKind.NO_CONSOLE)
                 else -> ConnectRefused(code, "Console CONNECT was refused${if (code != 0) " (HTTP $code)" else ""}.", ConsoleFailureKind.FAILED)
             }
         }
@@ -80,16 +85,20 @@ class ConsoleSession internal constructor(private val socket: Socket, encodings:
          * sent) and runs `CONNECT`. [logout] runs once when the returned session closes; it is not called when
          * opening fails, so the caller must end the XAPI session in that case.
          */
-        fun open(uri: URI, pin: String, token: String, logout: () -> Unit, encodings: List<Int> = RfbEncoding.DEFAULT): ConsoleSession {
-            try { return openOnce(uri, pin, token, logout, encodings, sessionQuery = false) }
+        fun open(uri: URI, pin: String, token: String, logout: () -> Unit, encodings: List<Int> = RfbEncoding.DEFAULT,
+            abort: ConsoleAbort? = null, subject: ConsoleSubject = ConsoleSubject.VM): ConsoleSession {
+            try { return openOnce(uri, pin, token, logout, encodings, sessionQuery = false, abort, subject) }
             catch (refused: ConnectRefused) {
                 if (refused.status != 401 && refused.status != 403) throw refused
             }
-            return openOnce(uri, pin, token, logout, encodings, sessionQuery = true)
+            return openOnce(uri, pin, token, logout, encodings, sessionQuery = true, abort, subject)
         }
 
-        private fun openOnce(uri: URI, pin: String, token: String, logout: () -> Unit, encodings: List<Int>, sessionQuery: Boolean): ConsoleSession {
+        private fun openOnce(uri: URI, pin: String, token: String, logout: () -> Unit, encodings: List<Int>, sessionQuery: Boolean,
+            abort: ConsoleAbort?, subject: ConsoleSubject): ConsoleSession {
             val socket = ServerTrust.context(pin).socketFactory.createSocket() as SSLSocket
+            // The controller's deadline closes this socket if the connect, TLS or CONNECT exchange blocks for too long.
+            abort?.register(socket)
             try {
                 socket.soTimeout = HANDSHAKE_TIMEOUT_MILLIS
                 socket.enabledProtocols = socket.supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
@@ -101,7 +110,8 @@ class ConsoleSession internal constructor(private val socket: Socket, encodings:
                         ServerTrust.fingerprint(it) == pin
                     } == true
                 }
-                connect(socket, uri, token, sessionQuery) { verifier.verify(host, socket.session) }
+                connect(socket, uri, token, sessionQuery, subject) { verifier.verify(host, socket.session) }
+                abort?.release(socket)
                 return ConsoleSession(socket, encodings, logout)
             } catch (error: Exception) {
                 runCatching { socket.close() }
@@ -115,7 +125,8 @@ class ConsoleSession internal constructor(private val socket: Socket, encodings:
 internal object ConsoleOpener {
     private fun endpoint(uri: URI) = "https://" + uri.host + if (uri.port == -1) "" else ":${uri.port}"
 
-    suspend fun open(profile: Profile, uri: URI, token: String, logout: () -> Unit, encodings: List<Int>): ConsoleSession {
+    suspend fun open(profile: Profile, uri: URI, token: String, logout: () -> Unit, encodings: List<Int>,
+        subject: ConsoleSubject = ConsoleSubject.VM): ConsoleSession {
         val decision = ConsoleTrust.decide(profile, uri)
         val pin = when (decision) {
             is ConsoleTrust.Decision.Pinned -> decision.pin
@@ -124,16 +135,16 @@ internal object ConsoleOpener {
                 val certificate = try { ServerTrust.inspect(endpoint(uri)) } catch (error: Exception) { throw ConsoleFailures.classify(error) }
                 // The coordinator may be reachable by another name or address; the same certificate is the same trust.
                 if (certificate.sha256 == profile.certificateSha256) profile.certificateSha256
-                else throw MemberTrustRequired(decision.authority, certificate, null)
+                else throw MemberTrustRequired(decision.authority, certificate, null, subject)
             }
         }
         try {
-            return ConsoleSession.open(uri, pin, token, logout, encodings)
+            return ConsoleSession.open(uri, pin, token, logout, encodings, currentCoroutineContext()[ConsoleAbort], subject)
         } catch (error: ConsoleError) {
             if (error.kind == ConsoleFailureKind.CERTIFICATE && decision is ConsoleTrust.Decision.Pinned && decision.member) {
                 // An approved member now presents another certificate: show it for a fresh review.
                 val certificate = runCatching { ServerTrust.inspect(endpoint(uri)) }.getOrNull()
-                if (certificate != null && certificate.sha256 != pin) throw MemberTrustRequired(MemberPins.authority(uri), certificate, pin)
+                if (certificate != null && certificate.sha256 != pin) throw MemberTrustRequired(MemberPins.authority(uri), certificate, pin, subject)
             }
             throw error
         }

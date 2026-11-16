@@ -8,6 +8,7 @@ import androidx.compose.runtime.*
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.meteor.app.ControlGates
 import com.meteor.app.MeteorState
 import com.meteor.app.MeteorViewModel
 import com.meteor.app.PendingTrust
@@ -38,13 +39,18 @@ import java.util.Date
                     Fingerprint("Saved SHA-256", previous.certificateSha256)
                 } else Text("The observed certificate matches the saved pin.", style = MaterialTheme.typography.bodySmall)
             }
+            // --- vault recovery --- Adding a server and username that is already saved updates that connection instead of adding one.
+            pending.previous?.takeIf { ConnectionProfiles.replacesOnAdd(it, state.editingProfileId, pending.followedFrom) }?.let { saved ->
+                Text("A saved connection for this server and username already exists (${saved.label}). Trusting it replaces that connection's name and password with what you entered.")
+            }
+            // --- end vault recovery ---
             Text("Accepting pins this certificate for future connections.", style = MaterialTheme.typography.bodySmall)
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(verified, { verified = it })
                 Text("I compared the fingerprint with a trusted source.", style = MaterialTheme.typography.bodySmall)
             }
         }
-    }, confirmButton = { TextButton(onClick = model::acceptTrust, enabled = verified && !state.profileBusy && !state.operationBusy) { Text("Trust and connect") } },
+    }, confirmButton = { TextButton(onClick = model::acceptTrust, enabled = verified && !state.profileBusy && !ControlGates.operationExclusive(state)) { Text("Trust and connect") } },
         dismissButton = { TextButton(onClick = model::cancelTrust) { Text("Cancel") } })
 }
 
@@ -52,9 +58,9 @@ import java.util.Date
     var historyChecked by remember(review) { mutableStateOf(false) }
     AlertDialog(onDismissRequest = model::cancelReview, title = { Text("Review ${review.operation.vmName}") }, text = {
         Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("Original action: ${review.operation.action.title}\nCurrent state: ${review.details.power}\nConnection: ${state.selectedProfile?.label.orEmpty()}")
-            Text("This fresh VM read does not prove the old task finished. Check this VM's task history on the server and make sure the action is no longer pending before closing the record.")
-            Text("The original action stays recorded with an unverified outcome. Closing this record sends no power command and permits new actions after a fresh confirmation.")
+            // Journaled operation hardening: a missing VM or an uninterpretable record has its own wording.
+            Text("Original action: ${ReviewText.originalAction(review.operation)}\nCurrent state: ${ReviewText.currentState(review)}\nConnection: ${state.selectedProfile?.label.orEmpty()}")
+            ReviewText.explanation(review).forEach { Text(it) }
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Checkbox(checked = historyChecked, onCheckedChange = { historyChecked = it })
                 Text("I checked the server task history and confirmed this action is no longer pending.", style = MaterialTheme.typography.bodySmall)

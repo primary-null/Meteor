@@ -71,7 +71,8 @@ fun VmDetailSections(vmUuid: String) {
             if (info.memoryDynamicMin != null && info.memoryDynamicMax != null) "Dynamic ${HistoryFormat.size(info.memoryDynamicMin)} – ${HistoryFormat.size(info.memoryDynamicMax)}" else null,
             info.memoryStaticMax?.let { "static maximum ${HistoryFormat.size(it)}" },
         ).filterNotNull().joinToString(" · ").ifBlank { "Not reported" })
-        InfoRow("Tags", info.tags.joinToString(", ").ifBlank { "None" })
+        InfoRow("Tags", info.tags.joinToString(", ").ifBlank { "None" } +
+            if (info.tagTotal > info.tags.size) " (first ${info.tags.size} of ${info.tagTotal})" else "") // inventory scale
         // CD drives and snapshots are shown by B2's CdDriveSection and SnapshotsSection, which add the actions.
         Text("Read from the server ${time(info.observedAt)}. Meteor does not change these settings.", style = MaterialTheme.typography.labelSmall)
     }
@@ -108,6 +109,7 @@ fun HostDetailSections(hostUuid: String) {
         SectionLabel("Network interfaces")
         if (info.nics.isEmpty()) Text("No network interfaces reported", style = MaterialTheme.typography.bodySmall)
         info.nics.forEach { nic -> Text(nicText(nic), style = MaterialTheme.typography.bodySmall) }
+        if (info.nicTotal > info.nics.size) Text("Showing ${info.nics.size} of ${info.nicTotal} interfaces.", style = MaterialTheme.typography.bodySmall) // inventory scale
         Text("Read from the server ${time(info.observedAt)}. Meteor does not change host settings.", style = MaterialTheme.typography.labelSmall)
     }
 }

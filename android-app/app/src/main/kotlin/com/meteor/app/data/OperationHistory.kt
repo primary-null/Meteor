@@ -20,6 +20,14 @@ object OperationHistory {
         else -> now - operation.updatedAt in 0..CARD_LINGER_MILLIS
     }
 
+    /**
+     * Milliseconds from [now] until the card of the closed [operation] must be gone, or null when no timer applies: an
+     * unresolved record stays, a record already past its time (or dated in the future) is not shown. Used to schedule a
+     * recomposition at the exact moment, so the card does not depend on a periodic tick.
+     */
+    fun cardTimeLeft(operation: PowerOperation?, now: Long): Long? =
+        if (operation != null && !operation.unresolved && cardVisible(operation, now)) operation.updatedAt + CARD_LINGER_MILLIS - now + 1 else null
+
     fun include(operations: List<PowerOperation>, next: PowerOperation): List<PowerOperation> {
         val all = operations.filterNot { it.id == next.id } + next
         return (all.filter { it.unresolved } + all.filterNot { it.unresolved }.sortedByDescending { it.updatedAt }.take(50))
@@ -29,6 +37,7 @@ object OperationHistory {
     // --- B2 storage/host ---
     /** "Subject · action" for the operation card and history. VM kinds keep their 1.9/A2 wording. */
     fun title(operation: PowerOperation): String {
+        if (operation.settings != null) return "${operation.vmName} · Edit settings" // --- VM settings ---
         val action = operation.targetAction ?: return "${operation.vmName} · ${operation.action.title}"
         val target = operation.targetName.orEmpty()
         val subject = when (action.targetKind) {
@@ -43,6 +52,10 @@ object OperationHistory {
         // --- B2 storage/host ---
         else if (operation.targetAction != null && operation.phase == PowerPhase.VERIFYING) "Verifying server state"
         // --- end B2 storage/host ---
+        // --- VM settings ---
+        else if (operation.settings != null && operation.phase == PowerPhase.VERIFYING) "Reading back"
+        else if (operation.settings != null && operation.phase == PowerPhase.FAILED && operation.settings.any { it.state == SettingState.DONE }) "Partly saved"
+        // --- end VM settings ---
         else when (operation.phase) {
             PowerPhase.PREPARED -> "Preparing"
             PowerPhase.SUBMITTING -> "Sending once"

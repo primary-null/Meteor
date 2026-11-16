@@ -46,13 +46,21 @@ interface AlertNotifier {
     fun clearAttention(profileId: String)
 }
 
-enum class CheckOutcome { NOTIFIED, NOTHING_NEW, CERTIFICATE_CHANGED, AUTHENTICATION_FAILED, POOL_MEMBER, FAILED, TIMED_OUT, SKIPPED_BUDGET }
+/** Removes alert notifications that no longer apply. The in-app Alerts inbox uses it. */
+interface AlertNotificationCleaner {
+    /** Cancels every alert notification of this profile and its group summary (not the "needs attention" one). */
+    fun clearProfile(profileId: String)
+    /** Cancels the notifications of these alerts (message references) and counts the group summary again from what is left. */
+    fun clearAlerts(profileId: String, refs: Collection<String>)
+}
 
 data class BackgroundRunReport(
     val outcomes: Map<String, CheckOutcome> = emptyMap(), val notified: Int = 0,
     val vaultUnavailable: Boolean = false, val blocked: Boolean = false, val removedProfiles: Set<String> = emptySet(),
     /** The WorkManager period still needed afterwards, or null when no profile is opted in. */
     val periodMinutes: Int? = null,
+    /** True when a transport failure or timeout is waiting for a quick retry, so the worker asks WorkManager to run again after a backoff. */
+    val retryWanted: Boolean = false,
 )
 
 /**
@@ -65,14 +73,20 @@ data class BackgroundRunReport(
  * - Each profile is waited for at most [profileBudgetMillis]; the run stops starting profiles once fewer than that
  *   remain of [runBudgetMillis]. Skipped profiles stay due for the next run.
  * - The watermark is saved before notifications are posted, so a crash can lose a notification but never repeat one.
+ * - Alerts the in-app Alerts inbox has already shown (`seen`) are handled but not notified.
+ * - Every attempt that ends is recorded per profile: its time and outcome, the last successful time and the failures in a
+ *   row, so Settings can say what happened. A transport failure or timeout is retried sooner (see [BackgroundAlerts.due]);
+ *   a changed certificate, refused credentials, a pool-member answer and server errors wait for the normal interval.
  * - A pin mismatch, an authentication failure or a pool-member answer posts one "needs attention" notification per
- *   distinct problem; nothing is changed on the device or the server.
+ *   distinct problem; so do [BackgroundAlerts.FAILING_AFTER] failed checks in a row. Nothing is changed on the device or the server.
  */
 class BackgroundAlertRunner(
     private val vault: ProfileStorage,
     private val gateway: MeteorGateway,
     private val store: BackgroundAlertStore,
     private val notifier: AlertNotifier,
+    /** The in-app "seen" value, read only. */
+    private val seen: AlertSeenStore? = null,
     private val clock: () -> Long = System::currentTimeMillis,
     private val ioContext: CoroutineContext = Dispatchers.IO,
     private val runBudgetMillis: Long = RUN_BUDGET_MILLIS,
@@ -88,14 +102,17 @@ class BackgroundAlertRunner(
         val document = try { vault.load() } catch (error: Exception) {
             if (error is CancellationException) throw error
             // An unreadable vault is preserved as is; nothing is checked and nothing is pruned.
-            return BackgroundRunReport(vaultUnavailable = true, periodMinutes = runCatching { BackgroundAlerts.periodMinutes(store.allSettings().values) }.getOrNull())
+            val period = runCatching { BackgroundAlerts.periodMinutes(store.allSettings().values) }.getOrNull()
+            if (period != null) note(started, RunProblem.VAULT_UNAVAILABLE)
+            return BackgroundRunReport(vaultUnavailable = true, periodMinutes = period)
         }
         val removed = store.retainOnly(document.profiles.map { it.id }.toSet())
         val settings = store.allSettings()
         val period = BackgroundAlerts.periodMinutes(settings.values)
         if (period == null) return BackgroundRunReport(removedProfiles = removed)
-        if (!notifier.canPost) return BackgroundRunReport(blocked = true, removedProfiles = removed, periodMinutes = period)
-        val due = BackgroundAlerts.due(document.profiles, settings, store.lastChecked(), started)
+        if (!notifier.canPost) { note(started, RunProblem.NOTIFICATIONS_BLOCKED); return BackgroundRunReport(blocked = true, removedProfiles = removed, periodMinutes = period) }
+        note(started, RunProblem.OK)
+        val due = BackgroundAlerts.due(document.profiles, settings, store.statuses(), started)
         val outcomes = LinkedHashMap<String, CheckOutcome>()
         var notified = 0
         for (profile in due) {
@@ -105,42 +122,61 @@ class BackgroundAlertRunner(
             outcomes[profile.id] = outcome
             notified += count
         }
-        return BackgroundRunReport(outcomes, notified, removedProfiles = removed, periodMinutes = period)
+        // Any opted-in profile still waiting for a quick retry asks WorkManager to run again, even if this run was too early for it.
+        val statuses = store.statuses()
+        val retryWanted = settings.any { (id, setting) -> setting.enabled && BackgroundAlerts.retryPending(statuses[id]) }
+        return BackgroundRunReport(outcomes, notified, removedProfiles = removed, periodMinutes = period, retryWanted = retryWanted)
+    }
+
+    /** Best effort: a note that cannot be saved must not stop the check. */
+    private suspend fun note(at: Long, problem: RunProblem) {
+        try { store.setRunNote(RunNote(at, problem)) } catch (error: Exception) { if (error is CancellationException) throw error }
     }
 
     private suspend fun check(profile: Profile, setting: AlertNotifySettings): Pair<CheckOutcome, Int> {
         val now = clock()
         val previous = store.watermark(profile.id)
-        val since = BackgroundAlerts.since(profile, setting, previous, now)
-        // Recorded first: a profile that fails or times out waits for its next interval instead of a quick re-login.
-        store.setLastChecked(profile.id, now)
-        return when (val result = bounded(profileBudgetMillis, ioContext) { gateway.backgroundAlerts(profile, since, BackgroundAlerts.wanted(setting)) }) {
-            is Bounded.Done -> {
+        val before = store.statuses()[profile.id]
+        val inAppSeen = try { seen?.lastSeen(profile.id) } catch (error: Exception) { if (error is CancellationException) throw error; null }
+        // Only an attempt that ends is recorded (below), so a run that is cancelled or killed midway leaves the profile due.
+        val since = BackgroundSince { authority, serverClock -> BackgroundAlerts.since(setting, previous, authority, serverClock) }
+        var notifiedCount = 0
+        val outcome: CheckOutcome = when (val result = bounded(profileBudgetMillis, ioContext) { gateway.backgroundAlerts(profile, since, BackgroundAlerts.wanted(setting)) }) {
+            is Bounded.Done -> try {
                 val fetch = result.value
-                val decision = BackgroundAlerts.decide(profile, setting, previous, fetch, now)
-                store.setWatermark(profile.id, decision.watermark)
+                val decision = BackgroundAlerts.decide(profile, setting, previous, fetch, inAppSeen)
+                store.setWatermark(profile.id, decision.watermark, rewind = decision.rewound)
                 if (store.attention(profile.id) != null) { store.setAttention(profile.id, null); runCatching { notifier.clearAttention(profile.id) } }
                 val batch = AlertNotificationContent.batch(profile, fetch, decision.notify)
-                if (batch == null) CheckOutcome.NOTHING_NEW to 0
-                else if (runCatching { notifier.post(batch) }.isSuccess) CheckOutcome.NOTIFIED to decision.notify.size
-                else CheckOutcome.FAILED to 0
-            }
+                if (batch == null) CheckOutcome.NOTHING_NEW
+                else if (runCatching { notifier.post(batch) }.isSuccess) CheckOutcome.NOTIFIED.also { notifiedCount = decision.notify.size }
+                else CheckOutcome.NOTIFY_FAILED
+            } catch (error: ServerTimeUnavailable) { CheckOutcome.SERVER_TIME_UNAVAILABLE }
             is Bounded.Failed -> {
                 val kind = attentionKind(result.error)
-                if (kind != null) {
-                    val marker = BackgroundAlerts.attentionMarker(kind, profile)
-                    if (store.attention(profile.id) != marker && runCatching { notifier.attention(profile.id, AlertNotificationContent.attention(kind, profile)) }.isSuccess)
-                        store.setAttention(profile.id, marker)
+                if (kind != null) postAttention(profile, kind)
+                when {
+                    kind == AttentionKind.CERTIFICATE_CHANGED -> CheckOutcome.CERTIFICATE_CHANGED
+                    kind == AttentionKind.AUTHENTICATION_FAILED -> CheckOutcome.AUTHENTICATION_FAILED
+                    kind == AttentionKind.POOL_MEMBER -> CheckOutcome.POOL_MEMBER
+                    result.error is ServerTimeUnavailable -> CheckOutcome.SERVER_TIME_UNAVAILABLE
+                    result.error is RpcFailure || result.error is GatewayError -> CheckOutcome.SERVER_ERROR
+                    else -> CheckOutcome.FAILED
                 }
-                when (kind) {
-                    AttentionKind.CERTIFICATE_CHANGED -> CheckOutcome.CERTIFICATE_CHANGED
-                    AttentionKind.AUTHENTICATION_FAILED -> CheckOutcome.AUTHENTICATION_FAILED
-                    AttentionKind.POOL_MEMBER -> CheckOutcome.POOL_MEMBER
-                    null -> CheckOutcome.FAILED
-                } to 0
             }
-            Bounded.TimedOut -> CheckOutcome.TIMED_OUT to 0
+            Bounded.TimedOut -> CheckOutcome.TIMED_OUT
         }
+        val status = CheckStatus.after(before, now, outcome)
+        store.setStatus(profile.id, status)
+        // Checks that keep failing without a reason that already has its own notification: say so once.
+        if (!outcome.success && !outcome.needsUser && status.failures >= BackgroundAlerts.FAILING_AFTER) postAttention(profile, AttentionKind.CHECKS_FAILING)
+        return outcome to notifiedCount
+    }
+
+    private suspend fun postAttention(profile: Profile, kind: AttentionKind) {
+        val marker = BackgroundAlerts.attentionMarker(kind, profile)
+        if (store.attention(profile.id) != marker && runCatching { notifier.attention(profile.id, AlertNotificationContent.attention(kind, profile)) }.isSuccess)
+            store.setAttention(profile.id, marker)
     }
 
     private fun attentionKind(error: Throwable): AttentionKind? = when {

@@ -10,6 +10,7 @@ import com.meteor.app.data.B2Fixtures.profile
 import com.meteor.app.data.B2Fixtures.snapshot
 import com.meteor.app.data.B2Fixtures.vm
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import org.junit.Assert.*
 import org.junit.Test
 import java.io.IOException
@@ -46,8 +47,11 @@ class TargetServiceTest {
         override suspend fun submit(authority: String, uuid: String, action: PowerAction): String = error("VM sends must not be used")
         override suspend fun taskUuid(reference: String) = "uuid-$reference"
         override suspend fun taskReference(uuid: String): String { taskLookupFailure?.let { throw it }; return uuid.removePrefix("uuid-") }
+        /** Journaled operation hardening: the next this-many task observations fail as unreachable. */
+        var transientReads = 0
         override suspend fun observeTask(reference: String): TaskObservation {
             readFailure?.let { throw it }
+            if (transientReads > 0) { transientReads--; throw IOException("coordinator unreachable") }
             return if (reference.startsWith("step:")) stepTask(stepByRef.getValue(reference)) else task
         }
         override suspend fun target(authority: String, kind: TargetKind, uuid: String): TargetState {
@@ -125,7 +129,8 @@ class TargetServiceTest {
         val (takeStore, takeBackend, take) = setup(vm(), proofAfter(TargetAction.SNAPSHOT_TAKE))
         val taken = take.executeTarget(profile, confirm(TargetAction.SNAPSHOT_TAKE, vm(), name = "Snap"))
         assertEquals("snap-new", taken.argumentUuid); assertEquals("Snap", taken.argumentName)
-        assertEquals("snap-1", takeStore.load().single().marker?.get("snapshots"))
+        // inventory scale: the marker records the snapshots that already carry the requested name (none here), complete and bounded
+        assertEquals("", takeStore.load().single().marker?.get("snapshots"))
         assertEquals(listOf("SNAPSHOT_TAKE:vm:Snap"), takeBackend.sent)
     }
     @Test fun unchangedStateAfterTaskSuccessIsUnknownAndReconcileNeverResends() = runTest {
@@ -432,4 +437,57 @@ class TargetServiceTest {
         assertFalse(store.load().single().unresolved)
         assertEquals(2, backend.sent.size)
     }
+
+    // --- journaled operation hardening ---
+    @Test fun hostTrackingToleratesABoundedRunOfUnreachableObservations() = runTest {
+        for (failures in listOf(TrackingPolicy.TRANSIENT_FAILURES, TrackingPolicy.TRANSIENT_FAILURES + 1)) {
+            val action = TargetAction.HOST_EVACUATE
+            val (store, backend, _) = setup(eligibleState(action), proofAfter(action))
+            backend.transientReads = failures
+            val waits = mutableListOf<Long>()
+            val result = PowerService(backend, store, { B2Fixtures.NOW }, { waits += it }).executeTarget(profile, confirm(action, eligibleState(action)))
+            if (failures <= TrackingPolicy.TRANSIENT_FAILURES) assertEquals(result.message, PowerPhase.SUCCEEDED, result.phase)
+            else { assertEquals(PowerPhase.UNKNOWN, result.phase); assertTrue(result.unresolved) }
+            assertEquals(1, backend.sent.size)
+        }
+    }
+
+    // --- stop watching ---
+    @Test fun stoppingDuringADeleteSubStepSendsNothingMoreAndRecoversLikeARestart() = runTest {
+        val (store, backend, service) = deleteSetup()
+        val watch = TrackingWatch()
+        backend.stepTask = { step -> if (step.uuid == "vdi-a") { watch.stop(); TaskObservation("pending", 0.2) } else TaskObservation("success", 1.0) }
+        val stopped = runCatching { withContext(watch) { service.executeTarget(profile, confirm(TargetAction.SNAPSHOT_DELETE, target)) } }
+        assertTrue(stopped.exceptionOrNull() is StopWatching)
+        val saved = store.load().single()
+        assertTrue(saved.unresolved); assertEquals(PowerPhase.UNKNOWN, saved.phase); assertNull(saved.manualResolution)
+        assertTrue(saved.message, saved.message.contains("Nothing was cancelled on the server") && saved.message.contains("remaining sub-steps will not be sent"))
+        assertEquals(listOf(StepState.TRACKING, StepState.PENDING, StepState.PENDING), saved.steps!!.map { it.state })
+        assertEquals("uuid-step:vdi-a", saved.steps!!.first().taskUuid)
+        assertEquals(listOf("VDI_DESTROY:vdi-a"), backend.sent)
+        // Check status observes the sub-step by its saved task UUID; the remaining sub-steps are never sent automatically.
+        backend.stepTask = { TaskObservation("success", 1.0) }
+        val checked = service.reconcile(profile, saved)
+        assertEquals(PowerPhase.UNKNOWN, checked.phase); assertTrue(checked.unresolved)
+        assertTrue(checked.message, checked.message.contains("never sends the remaining steps automatically"))
+        assertEquals(listOf(StepState.DONE, StepState.PENDING, StepState.PENDING), store.load().single().steps!!.map { it.state })
+        assertEquals(listOf("VDI_DESTROY:vdi-a"), backend.sent)
+    }
+    @Test fun stoppingASingleStepTargetKeepsItsTicketForCheckStatus() = runTest {
+        val (store, backend, service) = setup(host(enabled = false, resident = listOf("Guest")), host(enabled = false))
+        val watch = TrackingWatch()
+        var observed = 0
+        backend.task = TaskObservation("pending", 0.4)
+        val stopped = runCatching { withContext(watch) {
+            service.executeTarget(profile, confirm(TargetAction.HOST_EVACUATE, host(enabled = false, resident = listOf("Guest")))) { if (it.progress != null && ++observed == 1) watch.stop() }
+        } }
+        assertTrue(stopped.exceptionOrNull() is StopWatching)
+        val saved = store.load().single()
+        assertEquals(PowerPhase.UNKNOWN, saved.phase); assertTrue(saved.unresolved); assertEquals("uuid-task-1", saved.taskUuid)
+        assertEquals(1, backend.sent.size)
+        backend.task = TaskObservation("success", 1.0)
+        assertEquals(PowerPhase.SUCCEEDED, service.reconcile(profile, saved).phase)
+        assertEquals(1, backend.sent.size)
+    }
+    // --- end stop watching ---
 }

@@ -26,6 +26,7 @@ object KeySyms {
     const val MENU = 0xff67
     const val NUM_LOCK = 0xff7f
     const val KP_ENTER = 0xff8d
+    const val KP_DELETE = 0xff9f
     const val KP_MULTIPLY = 0xffaa
     const val KP_ADD = 0xffab
     const val KP_SUBTRACT = 0xffad
@@ -124,20 +125,64 @@ object ConsoleKeys {
         KeyEvent.KEYCODE_NUMPAD_DIVIDE -> KeySyms.KP_DIVIDE
         else -> unicode.takeIf { it >= 0x20 && it != 0x7f }?.let { chord(it)?.keysym }
     }
+
+    /** Android system keys that always stay with the system, never reaching the guest. */
+    private fun isSystemKey(keyCode: Int) = keyCode == KeyEvent.KEYCODE_BACK || keyCode == KeyEvent.KEYCODE_HOME ||
+        keyCode == KeyEvent.KEYCODE_APP_SWITCH || keyCode == KeyEvent.KEYCODE_VOLUME_UP ||
+        keyCode == KeyEvent.KEYCODE_VOLUME_DOWN || keyCode == KeyEvent.KEYCODE_POWER
+
+    /**
+     * Passes one hardware key event to [input]. Returns true when the guest took it; false leaves the event to the
+     * system, which is what happens for system keys, keys with no mapping, and every key in view-only mode.
+     * [repeat] marks an auto-repeat key-down (a held key), which is forwarded as another key-down.
+     */
+    fun forward(input: ConsoleInput, keyCode: Int, unicode: Int, down: Boolean, repeat: Boolean): Boolean {
+        if (input.viewOnly || isSystemKey(keyCode)) return false
+        val keysym = fromAndroid(keyCode, unicode) ?: return false
+        input.keyEvent(keysym, down, repeat && down)
+        return true
+    }
 }
 
-/** What the soft keyboard changed relative to the one-character sentinel the hidden field holds. */
+/** What the soft keyboard changed in the hidden field: [backspaces] deleted characters, then [text] typed. */
 data class SoftKeyboardEdit(val backspaces: Int, val text: String)
 
+/**
+ * The rule behind the hidden soft-keyboard field. The field is never reset after an edit: the keyboard keeps the
+ * text it wrote, so it sees one continuous field and keeps its layout (symbols stay until the person presses ABC).
+ * Resetting the text after every edit made the toolkit restart the input connection each time, and the keyboard
+ * then fell back to letters.
+ *
+ * The field starts as [PAD], a run of spaces. The pad exists so that Backspace has something to delete (a keyboard sends
+ * Backspace on an empty field as a key event, or not at all). Each change the keyboard reports is compared with the text
+ * the field held: everything after the common start is deleted (Backspace presses) and the rest is typed. That covers a
+ * typed or committed character, a deleted one, an autocorrect that replaces the end of a word, and a swiped word. Only
+ * when the pad is nearly used up, or the text has grown long, is the field replaced by a fresh pad ([Step.field]); the
+ * keyboard may then fall back to letters once, which is rare and never in the middle of a symbol run.
+ */
 object SoftKeyboard {
-    /** Text the hidden field always returns to. A deletion of the sentinel is a Backspace. */
-    const val SENTINEL = " "
+    const val PAD_LENGTH = 16
+    val PAD = " ".repeat(PAD_LENGTH)
+    /** Fewer characters than this left (the pad is nearly deleted): start over with a fresh pad. */
+    const val MIN_LENGTH = 4
+    /** More characters than this (about 128 typed): start over, unless the keyboard is composing a word. */
+    const val MAX_LENGTH = PAD_LENGTH + 128
+    /** Even a composing field starts over beyond this. */
+    const val HARD_LIMIT = 512
 
-    fun diff(current: String): SoftKeyboardEdit = when {
-        current == SENTINEL -> SoftKeyboardEdit(0, "")
-        current.startsWith(SENTINEL) -> SoftKeyboardEdit(0, current.substring(SENTINEL.length))
-        SENTINEL.startsWith(current) -> SoftKeyboardEdit(SENTINEL.length - current.length, "")
-        else -> SoftKeyboardEdit(SENTINEL.length, current)
+    /** [edit] is what to send; [field] is the text the hidden field must hold from now on. */
+    data class Step(val edit: SoftKeyboardEdit, val field: String)
+
+    /** [previous] is the field's text before the change, [next] what the keyboard changed it to, [composing] whether [next] has a composing region. */
+    fun step(previous: String, next: String, composing: Boolean = false): Step {
+        var common = 0
+        val limit = minOf(previous.length, next.length)
+        while (common < limit && previous[common] == next[common]) common++
+        // Never split a surrogate pair: the whole character is deleted and typed again.
+        if (common > 0 && common < previous.length && Character.isHighSurrogate(previous[common - 1])) common--
+        val edit = SoftKeyboardEdit(previous.codePointCount(common, previous.length), next.substring(common))
+        val startOver = next.length < MIN_LENGTH || next.length > HARD_LIMIT || (!composing && next.length > MAX_LENGTH)
+        return Step(edit, if (startOver) PAD else next)
     }
 }
 
@@ -184,6 +229,16 @@ class ConsoleInput(private val sink: ConsoleSink) {
     private var x = 0
     private var y = 0
     private var viewOnlyFlag = false
+    private var noCtrlAltDel = false
+
+    /**
+     * Set for a host console: Ctrl+Alt+Del is never sent, neither as [ctrlAltDel] nor as Delete pressed while Control and
+     * Alt are down (sticky or held). On the hypervisor's own console it could restart the host outside Meteor's guarded,
+     * journaled host reboot.
+     */
+    var blockCtrlAltDel: Boolean
+        get() = synchronized(lock) { noCtrlAltDel }
+        set(value) = synchronized(lock) { noCtrlAltDel = value }
 
     var viewOnly: Boolean
         get() = synchronized(lock) { viewOnlyFlag }
@@ -197,7 +252,14 @@ class ConsoleInput(private val sink: ConsoleSink) {
 
     private inline fun locked(block: () -> Unit) = synchronized(lock) { block() }
 
+    /** Delete, keypad Delete and keypad decimal (the same physical key with Num Lock off). */
+    private val DELETE_KEYS = setOf(KeySyms.DELETE, KeySyms.KP_DELETE, KeySyms.KP_DECIMAL)
+    private fun ctrlAltChord(keysym: Int) = noCtrlAltDel && keysym in DELETE_KEYS &&
+        (KeySyms.CONTROL_L in held || KeySyms.CONTROL_R in held) && (KeySyms.ALT_L in held || KeySyms.ALT_R in held)
+
     private fun send(keysym: Int, down: Boolean) {
+        // A blocked Delete is dropped on the way down, and so is its release (it never reached the console).
+        if (ctrlAltChord(keysym) && (down || keysym !in held)) return
         if (down) held += keysym else held -= keysym
         sink.key(keysym, down)
     }
@@ -246,9 +308,15 @@ class ConsoleInput(private val sink: ConsoleSink) {
         }
     }
 
-    /** A hardware key event passed through unchanged. One-shot modifiers end after a non-modifier key goes up. */
-    fun keyEvent(keysym: Int, down: Boolean) = locked {
+    /**
+     * A hardware key event passed through unchanged. One-shot modifiers end after a non-modifier key goes up.
+     * With [repeat] set, a key-down for a key that is already down is sent again, as a VNC client does for
+     * auto-repeat: the guest's emulated keyboard does not repeat held keys by itself. Modifiers never repeat,
+     * and a key-down without [repeat] for a key already down is still dropped as a duplicate.
+     */
+    fun keyEvent(keysym: Int, down: Boolean, repeat: Boolean = false) = locked {
         if (viewOnlyFlag) return@locked
+        if (down && repeat && keysym in held && !KeySyms.isModifier(keysym)) { sink.key(keysym, true); return@locked }
         if (down == (keysym in held)) return@locked
         send(keysym, down)
         if (!down && !KeySyms.isModifier(keysym)) consumeOneShots()
@@ -256,7 +324,7 @@ class ConsoleInput(private val sink: ConsoleSink) {
 
     /** Control, Alt and Delete as one key sequence. It is not an XAPI reboot. */
     fun ctrlAltDel() = locked {
-        if (viewOnlyFlag) return@locked
+        if (viewOnlyFlag || noCtrlAltDel) return@locked
         val chord = listOf(KeySyms.CONTROL_L, KeySyms.ALT_L, KeySyms.DELETE)
         val pressed = chord.filter { it !in held }
         pressed.forEach { send(it, true) }

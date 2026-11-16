@@ -215,7 +215,7 @@ data class MissingTarget(override val authority: String, override val kind: Targ
 }
 
 data class IsoChoice(val uuid: String, val name: String, val srName: String)
-data class IsoCatalog(val isos: List<IsoChoice>, val truncated: Boolean)
+data class IsoCatalog(val isos: List<IsoChoice>, val truncated: Boolean, val total: Int = isos.size) // inventory scale: total
 data class IsoChoiceRequest(val drive: CdDrive, val catalog: IsoCatalog, val observedAt: Long)
 
 /** A B2 confirmation, bound to the connection identity and the fresh target read it was built from. */
@@ -250,7 +250,9 @@ object TargetRules {
         if (state.kind != action.targetKind) return "This action does not apply to a ${state.kind.label}."
         if (state.busy) return "Another operation is active on this ${state.kind.label}."
         val specific = when (state) {
-            is VmTarget -> null
+            // inventory scale: a take is proven against the full snapshot list; without it the proof could be wrong
+            is VmTarget -> if (action == TargetAction.SNAPSHOT_TAKE && state.snapshotsTruncated)
+                "This VM has more snapshots than Meteor reads at once, so a new snapshot could not be verified." else null
             is SnapshotTarget -> if (state.liveBusy) "Another operation is active on ${state.vmName}." else null
             is CdDrive -> when {
                 action == TargetAction.CD_INSERT && !state.empty -> "Eject the current ISO first."
@@ -373,8 +375,11 @@ object TargetRules {
     fun revertedPower(snapshot: SnapshotTarget): String = if (snapshot.withMemory) "Suspended" else "Halted"
 
     /** Preflight facts the proof needs. Keys are stable journal keys. */
-    fun marker(action: TargetAction, state: TargetState): Map<String, String>? = when {
-        action == TargetAction.SNAPSHOT_TAKE && state is VmTarget -> mapOf("snapshots" to state.snapshots.map { it.uuid }.sorted().joinToString(","))
+    fun marker(action: TargetAction, state: TargetState, snapshotName: String? = null): Map<String, String>? = when {
+        // inventory scale: only snapshots that already carry the requested name can be mistaken for the new one, so only
+        // they are recorded (complete, and bounded however many snapshots the VM has). Without a name: all, as before.
+        action == TargetAction.SNAPSHOT_TAKE && state is VmTarget -> mapOf("snapshots" to state.snapshots
+            .filter { snapshotName == null || it.name == snapshotName }.map { it.uuid }.sorted().joinToString(","))
         action == TargetAction.SNAPSHOT_REVERT && state is SnapshotTarget -> mapOf("parent" to state.liveParentUuid.orEmpty(),
             "disks" to state.liveDisks.sorted().joinToString(","), "power" to state.livePower, "expect" to revertedPower(state))
         state is HostState -> mapOf("master" to state.master.toString())
@@ -438,6 +443,7 @@ object TargetRules {
     /** The snapshot a take created: the requested name, and not present before the request. */
     fun newSnapshot(operation: PowerOperation, state: TargetState): SnapshotInfo? {
         if (operation.targetAction != TargetAction.SNAPSHOT_TAKE || state !is VmTarget || state.uuid != operation.vmUuid) return null
+        if (state.snapshotsTruncated) return null // inventory scale: never proven against a cut list
         val before = list(operation.marker?.get("snapshots") ?: return null)
         return state.snapshots.singleOrNull { it.name == operation.argumentName && it.uuid !in before }
     }

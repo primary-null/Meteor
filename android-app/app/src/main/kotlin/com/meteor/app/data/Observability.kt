@@ -9,48 +9,14 @@ import java.time.temporal.ChronoField
 
 enum class MetricKind { VM, HOST }
 data class MetricTarget(val authority: String, val uuid: String, val kind: MetricKind, val name: String)
-enum class MetricGroup { CPU, MEMORY, DISK, NETWORK }
+enum class MetricGroup { CPU, LOAD, MEMORY, DISK, NETWORK }
+/** [limit] is the source's finite maximum; null means the server reports no limit (an infinite maximum). */
 data class MetricReading(val name: String, val label: String, val unit: String, val group: MetricGroup,
-    val value: Double?, val unavailable: String? = null)
+    val value: Double?, val unavailable: String? = null, val limit: Double? = null)
 data class MetricSnapshot(val target: MetricTarget, val observedAt: Long, val readings: List<MetricReading>,
     val advertisedCount: Int, val note: String? = null)
 
-object MetricMapper {
-    private fun group(name: String): MetricGroup? = when {
-        name.matches(Regex("cpu(?:[0-9]+|_avg|_usage)")) -> MetricGroup.CPU
-        name in setOf("memory", "memory_internal_free", "memory_free_kib", "memory_total_kib", "memory_target") -> MetricGroup.MEMORY
-        name.startsWith("vbd_") -> MetricGroup.DISK
-        name.startsWith("vif_") || name.startsWith("pif_") -> MetricGroup.NETWORK
-        else -> null
-    }
-    fun snapshot(target: MetricTarget, sources: List<Map<String, Any?>>, now: Long): MetricSnapshot {
-        require(sources.size <= 4096) { "Too many metric sources." }
-        val names = sources.map { it["name_label"] as? String ?: throw GatewayError("invalid-metrics") }
-        require(names.all { it.isNotBlank() && it.length <= 160 } && names.distinct().size == names.size) { "Ambiguous metric identity." }
-        val selected = sources.filter { group(it["name_label"] as String) != null }
-            .groupBy { group(it["name_label"] as String)!! }.toSortedMap()
-            .flatMap { (_, entries) -> entries.sortedWith(compareBy<Map<String, Any?>> {
-                if (it["name_label"] == "cpu_avg") 0 else 1
-            }.thenBy { it["name_label"] as String }).take(4) }
-        val readings = selected.map { source ->
-            val name = source["name_label"] as String
-            val enabled = source["enabled"] == true || source["enabled"] == "true" || source["enabled"] == "1"
-            val value = source["value"]?.toString()?.toDoubleOrNull()?.takeIf { it.isFinite() && it >= 0 }
-            val label = when (name) {
-                "memory" -> "Allocated memory"
-                "memory_internal_free" -> "Guest-reported free memory"
-                "memory_free_kib" -> "Free memory"
-                "memory_total_kib" -> "Total memory"
-                "memory_target" -> "Target memory"
-                else -> name.replace('_', ' ').replaceFirstChar { it.uppercase() }
-            }
-            MetricReading(name, label, (source["units"] as? String).orEmpty().take(40), group(name)!!,
-                value.takeIf { enabled }, if (!enabled) "Source is not recorded" else if (value == null) "No valid sample" else null)
-        }
-        return MetricSnapshot(target, now, readings, sources.size,
-            if (readings.isEmpty()) "No supported metric sources were reported." else null)
-    }
-}
+// Choosing sources and turning queried samples into readings: see LiveMetrics.kt.
 
 /** In-memory samples, bounded by five minutes and sixty observations. Missing data stays missing. */
 object MetricWindow {

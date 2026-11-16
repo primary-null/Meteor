@@ -26,7 +26,7 @@ internal fun PoolActivityScreen(state: MeteorState, now: Long, refresh: () -> Un
                 style = MaterialTheme.typography.bodySmall)
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 TextButton(onClick = back) { Text("Back to overview") }
-                OutlinedButton(onClick = refresh, enabled = state.connected && !state.activityBusy && !state.loading && !state.operationBusy) { Text("Refresh activity") }
+                OutlinedButton(onClick = refresh, enabled = state.connected && !state.activityBusy && !state.loading && !ControlGates.operationExclusive(state)) { Text("Refresh activity") }
             }
             Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                 FilterChip(selected = !alerts, onClick = { alerts = false }, label = { Text("Tasks") })
@@ -44,7 +44,9 @@ internal fun PoolActivityScreen(state: MeteorState, now: Long, refresh: () -> Un
                 val section = activity.alerts
                 if (section.issue != null) item { Text(section.issue.text) }
                 else {
-                    item { Text("Showing ${section.items.size} of ${section.total} retained alerts.", style = MaterialTheme.typography.bodySmall) }
+                    item { Text(if (section.total == MessageWindow.TOTAL_UNKNOWN) // inventory scale: the shared large-store fallback
+                        "Showing the newest ${section.items.size} alerts of the last ${AlertMerge.FALLBACK_WINDOW_MILLIS / 86_400_000} days. The server's message store is larger than Meteor reads at once, so older alerts are not loaded."
+                        else "Showing ${section.items.size} of ${section.total} retained alerts.", style = MaterialTheme.typography.bodySmall) }
                     if (section.items.isEmpty()) item { Text("No alerts reported.") }
                     items(section.items, key = { "alert:$scopeKey:${it.uuid}" }) { alert ->
                         var details by rememberSaveable { mutableStateOf(false) }

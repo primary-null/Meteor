@@ -30,15 +30,19 @@ enum class RfbEvent { UPDATE, RESIZED, BELL, CLIPBOARD }
 
 /**
  * RFB 3.3 / 3.7 / 3.8 client with security type None. One decoder thread calls [readEvent]; any thread may
- * send key and pointer events. Pixels are always requested as 32 bpp, depth 24, little endian, 8 bits per
- * channel (red shift 16, green 8, blue 0), so Raw and Hextile pixels are `B G R pad` and ZRLE
- * compressed pixels (CPIXEL) are `B G R`.
+ * send key and pointer events. After ServerInit the client always sends a SetPixelFormat: [pixelFormat], by default
+ * [RfbPixelFormat.TRUE_COLOUR_32] (32 bpp, depth 24, little endian, red shift 16, green 8, blue 0, so Raw and Hextile pixels
+ * are `B G R pad` and ZRLE compressed pixels are `B G R`), or with `null` the server's own announced format sent back to it
+ * (when that is a true-colour format this client decodes; otherwise the 32 bpp format). The host console of a real XCP-ng
+ * 8.3 server sends nothing at all until a SetPixelFormat arrives, honours 32 bpp, and ignores a colour-map request.
+ * Decoders handle any true-colour format of 8, 16 or 32 bpp ([RfbPixelFormat.decodable]).
  *
  * Memory and work are bounded: the framebuffer is limited by [Framebuffer.validSize], every rectangle
  * must be non-empty and inside it, ZRLE data is inflated on demand with a size cap, and server clipboard
  * text is skipped without being stored.
  */
-class RfbProtocol(input: InputStream, output: OutputStream, private val encodings: List<Int> = RfbEncoding.DEFAULT) : Closeable {
+class RfbProtocol(input: InputStream, output: OutputStream, private val encodings: List<Int> = RfbEncoding.DEFAULT,
+    private val pixelFormat: RfbPixelFormat? = RfbPixelFormat.TRUE_COLOUR_32) : Closeable {
     companion object {
         private const val MAX_NAME = 65_536
         private const val MAX_CLIPBOARD_SKIP = 1_048_576
@@ -52,8 +56,7 @@ class RfbProtocol(input: InputStream, output: OutputStream, private val encoding
         const val WHEEL_RIGHT = 64
 
         /** SetPixelFormat: 32 bpp, depth 24, little endian, true colour, 255/255/255, shifts 16/8/0. */
-        fun pixelFormatMessage(): ByteArray = byteArrayOf(
-            0, 0, 0, 0, 32, 24, 0, 1, 0, 255.toByte(), 0, 255.toByte(), 0, 255.toByte(), 16, 8, 0, 0, 0, 0)
+        fun pixelFormatMessage(): ByteArray = RfbPixelFormat.TRUE_COLOUR_32.message()
 
         fun encodingsMessage(list: List<Int>): ByteArray {
             val out = ByteArray(4 + 4 * list.size)
@@ -81,6 +84,17 @@ class RfbProtocol(input: InputStream, output: OutputStream, private val encoding
     private val tile = IntArray(64 * 64)
     private val scratch = ByteArray(4096)
     @Volatile private var closed = false
+    /** The format the server sends pixels in, set by the handshake. */
+    private var format = RfbPixelFormat.TRUE_COLOUR_32
+    /** The app's long-standing format, decoded by the original fast paths. */
+    private var fast = true
+    private var bytesPerPixel = 4
+    /** ARGB for every pixel value of an 8 or 16 bpp format. */
+    private var table = IntArray(0)
+    private val cpixelBuffer = ByteArray(4)
+
+    /** The pixel format agreed with the server (valid after [handshake]). */
+    val agreedFormat: RfbPixelFormat get() = format
 
     val framebuffer: Framebuffer get() = checkNotNull(fb) { "The console handshake has not completed." }
     val ready: Boolean get() = fb != null
@@ -114,12 +128,14 @@ class RfbProtocol(input: InputStream, output: OutputStream, private val encoding
         send(byteArrayOf(1)) // ClientInit: shared, so other viewers such as XenCenter are not disconnected.
         val width = source.readUnsignedShort(); val height = source.readUnsignedShort()
         if (!Framebuffer.validSize(width, height)) fail("Console framebuffer is too large or invalid.")
-        source.readFully(ByteArray(16)) // The server's native pixel format is replaced below.
+        val native = RfbPixelFormat.parse(ByteArray(16).also(source::readFully))
         val nameSize = source.readInt()
         if (nameSize !in 0..MAX_NAME) fail("Invalid console name length.")
         val name = String(ByteArray(nameSize).also(source::readFully), Charsets.UTF_8).filter { it >= ' ' }.take(128)
         fb = Framebuffer(width, height)
-        send(pixelFormatMessage())
+        // Always sent, even when it repeats the native format: the host console answers nothing until it has one.
+        useFormat(pixelFormat ?: native.takeIf { it.decodable } ?: RfbPixelFormat.TRUE_COLOUR_32)
+        send(format.message())
         send(encodingsMessage(encodings))
         requestUpdate(false)
         return RfbServerInfo(width, height, name)
@@ -173,20 +189,47 @@ class RfbProtocol(input: InputStream, output: OutputStream, private val encoding
         if (w <= 0 || h <= 0 || x + w > target.width || y + h > target.height) fail("Unsupported console rectangle.")
     }
 
-    private fun cpixel(): Int = 0xff000000.toInt() or (Integer.reverseBytes(source.readInt()) and 0xffffff)
+    private fun useFormat(chosen: RfbPixelFormat) {
+        if (!chosen.decodable) fail("Unsupported console pixel format.", ConsoleFailureKind.UNSUPPORTED)
+        format = chosen
+        fast = chosen == RfbPixelFormat.TRUE_COLOUR_32
+        bytesPerPixel = chosen.bytesPerPixel
+        table = if (bytesPerPixel < 4) IntArray(1 shl chosen.bitsPerPixel) { chosen.argb(it) } else IntArray(0)
+    }
+
+    /** Assembles one pixel value from [count] bytes at [offset] in the format's byte order. */
+    private fun value(bytes: ByteArray, offset: Int, count: Int): Int {
+        var result = 0
+        if (format.bigEndian) for (i in 0 until count) result = (result shl 8) or (bytes[offset + i].toInt() and 0xff)
+        else for (i in count - 1 downTo 0) result = (result shl 8) or (bytes[offset + i].toInt() and 0xff)
+        return result
+    }
+
+    private fun argb(value: Int): Int = if (bytesPerPixel < 4) table[value] else format.argb(value)
+
+    /** One whole pixel from the stream (Raw rows are read in bulk instead). */
+    private fun cpixel(): Int {
+        if (fast) return 0xff000000.toInt() or (Integer.reverseBytes(source.readInt()) and 0xffffff)
+        return when (bytesPerPixel) {
+            1 -> table[source.readUnsignedByte()]
+            else -> { source.readFully(cpixelBuffer, 0, bytesPerPixel); argb(value(cpixelBuffer, 0, bytesPerPixel)) }
+        }
+    }
 
     private fun decodeRaw(x: Int, y: Int, w: Int, h: Int) {
         val target = framebuffer; val pixels = target.pixels; val stride = target.width
-        val bytes = w * 4
+        val size = bytesPerPixel
+        val bytes = w * size
         if (rowBuffer.size < bytes) rowBuffer = ByteArray(bytes)
         for (row in 0 until h) {
             source.readFully(rowBuffer, 0, bytes)
             var offset = (y + row) * stride + x; var index = 0
-            repeat(w) {
+            if (fast) repeat(w) {
                 pixels[offset++] = 0xff000000.toInt() or (rowBuffer[index].toInt() and 0xff) or
                     ((rowBuffer[index + 1].toInt() and 0xff) shl 8) or ((rowBuffer[index + 2].toInt() and 0xff) shl 16)
                 index += 4
-            }
+            } else if (size == 1) repeat(w) { pixels[offset++] = table[rowBuffer[index++].toInt() and 0xff] }
+            else repeat(w) { pixels[offset++] = argb(value(rowBuffer, index, size)); index += size }
         }
         target.markDirty(x, y, w, h)
     }
@@ -211,7 +254,7 @@ class RfbProtocol(input: InputStream, output: OutputStream, private val encoding
                 val mask = source.readUnsignedByte()
                 if (mask and 1 != 0) {
                     val pixels = target.pixels; val stride = target.width
-                    for (row in 0 until th) { var offset = (ty + row) * stride + tx; repeat(tw) { pixels[offset++] = 0xff000000.toInt() or (Integer.reverseBytes(source.readInt()) and 0xffffff) } }
+                    for (row in 0 until th) { var offset = (ty + row) * stride + tx; repeat(tw) { pixels[offset++] = cpixel() } }
                 } else {
                     if (mask and 2 != 0) background = cpixel()
                     if (mask and 4 != 0) foreground = cpixel()
@@ -268,8 +311,16 @@ class RfbProtocol(input: InputStream, output: OutputStream, private val encoding
         }
 
         fun pixel(): Int {
-            val blue = byte(); val green = byte(); val red = byte()
-            return 0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
+            if (fast) {
+                val blue = byte(); val green = byte(); val red = byte()
+                return 0xff000000.toInt() or (red shl 16) or (green shl 8) or blue
+            }
+            val count = format.cpixelBytes
+            for (i in 0 until count) cpixelBuffer[i] = byte().toByte()
+            var value = value(cpixelBuffer, 0, count)
+            // A 3-byte CPIXEL holds the most significant bytes when that is where the channels are (RFC 6143 section 7.7.6).
+            if (count == 3 && !format.fitsLow) value = value shl 8
+            return argb(value)
         }
 
         /** Consumes whatever the tiles did not use so the next rectangle continues the same zlib stream. */

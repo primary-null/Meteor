@@ -138,13 +138,16 @@ class XapiTransportIntegrationTest {
         "host.get_all_records" -> mapOf("host-ref" to mapOf("uuid" to "host-id", "name_label" to "Fixture host", "metrics" to "metrics-ref"))
         "host_metrics.get_all_records" -> mapOf("metrics-ref" to mapOf("live" to true, "memory_total" to "8192", "memory_free" to "4096"))
         "VM.get_all_records" -> mapOf("vm-ref" to mapOf("uuid" to "vm-id", "name_label" to "Fixture VM", "power_state" to "Running",
+            "is_a_template" to false, "is_control_domain" to false, "is_a_snapshot" to false,
             "resident_on" to "host-ref", "VCPUs_max" to "2", "memory_static_max" to "4096"))
         "SR.get_all_records" -> emptyMap<String, Any>()
         "VM.get_by_uuid" -> "vm-ref"
         "host.get_by_uuid" -> "host-ref"
         "host.get_record" -> mapOf("uuid" to "host-id")
-        "VM.get_data_sources", "host.get_data_sources" -> listOf(mapOf("name_label" to "cpu_avg", "enabled" to true,
-            "value" to "0.25", "units" to "fraction"))
+        "VM.get_data_sources" -> listOf(mapOf("name_label" to "cpu_usage", "enabled" to true, "value" to 0.0, "units" to "(fraction)", "max" to 1.0))
+        "host.get_data_sources" -> listOf(mapOf("name_label" to "cpu_avg", "enabled" to true, "value" to 0.0, "units" to "(fraction)", "max" to 1.0))
+        // A real server answers 0.0 in get_data_sources; the live value comes from query_data_source.
+        "VM.query_data_source", "host.query_data_source" -> 0.25
         "task.get_all_records" -> mapOf("task-ref" to mapOf("uuid" to "task-id", "name_label" to "Example task",
             "status" to "pending", "progress" to "1.0"))
         "message.get_all_records" -> if (largeMessageStore) (0 until 4000).associate { "ref-$it" to mapOf("uuid" to "u$it", "name" to "VM_STARTED", "priority" to "5",
@@ -167,7 +170,10 @@ class XapiTransportIntegrationTest {
         "VIF.get_record" -> mapOf("network" to "network-ref", "device" to "0", "MAC" to "00:00:00:00:00:00", "currently_attached" to true)
         "network.get_record" -> mapOf("name_label" to "Fixture network")
         "task.get_uuid" -> if (structTaskReference) mapOf("unexpected" to "struct") else "task-uuid"
-        else -> error("Unexpected fixture request: $method")
+        // inventory scale: filtered reads answer from the same fixture records
+        else -> if (method.endsWith(".get_all_records_where")) @Suppress("UNCHECKED_CAST") XapiWhere.filter(
+            result(method.removeSuffix("_where")) as Map<String, Map<String, Any?>>, XapiWhere.unescape(stringParam(bodies.last(), 1)))
+            else error("Unexpected fixture request: $method")
     }
 
     private fun value(input: Any): String = when (input) {
@@ -196,7 +202,10 @@ class XapiTransportIntegrationTest {
         assertEquals("host-id", inventory.guests.single().hostUuid)
         assertEquals(4096L, inventory.hosts.single().freeBytes)
         assertEquals(listOf("session.login_with_password", "pool.get_all_records", "host.get_all_records",
-            "host_metrics.get_all_records", "VM.get_all_records", "SR.get_all_records", "session.logout"), calls.toList())
+            "host_metrics.get_all_records", "VM.get_all_records_where", "SR.get_all_records", "session.logout"), calls.toList())
+        // inventory scale: templates, snapshots and control domains are excluded by the server
+        assertTrue(bodies[calls.indexOf("VM.get_all_records_where")].contains("field &quot;is_a_template&quot;=&quot;false&quot;"))
+        assertTrue(inventory.notLoaded.isEmpty())
         assertTrue(bodies.first().contains("fixture&lt;&amp;password"))
         assertTrue(agents.all { it == "Meteor-Spark/${BuildConfig.VERSION_NAME}" })
     }
@@ -208,8 +217,10 @@ class XapiTransportIntegrationTest {
             val target = MetricTarget("pool-id", if (kind == MetricKind.VM) "vm-id" else "host-id", kind, "Example")
             assertEquals(0.25, gateway.metrics(profile, target).readings.single().value!!, 0.0)
             val type = if (kind == MetricKind.VM) "VM" else "host"
-            assertEquals(listOf("session.login_with_password", "pool.get_all_records", "$type.get_by_uuid", "$type.get_record",
-                "$type.get_data_sources", "pool.get_all_records", "session.logout"), calls.toList())
+            val extra = if (kind == MetricKind.VM) listOf("VBD.get_record") else emptyList()
+            assertEquals(listOf("session.login_with_password", "pool.get_all_records", "$type.get_by_uuid", "$type.get_record") +
+                listOf("$type.get_data_sources") + extra +
+                listOf("$type.query_data_source", "pool.get_all_records", "session.logout"), calls.toList())
         }
     }
     @Test fun partialRolePermissionsPreserveReadableAlertsWithoutWrites() = runBlocking {
@@ -321,13 +332,31 @@ class XapiTransportIntegrationTest {
         assertEquals("ref-new", parsed.ref); assertEquals(2, parsed.priority); assertEquals(AlertObjectKind.HOST, parsed.objectKind)
         assertEquals("host-id", parsed.objectUuid); assertNotNull(parsed.timestamp)
     }
-    @Test fun aMessageStoreTooLargeToParseFallsBackToTheRecentWindowAndSaysSo() = runBlocking {
+    // inventory scale: a store of 4,000 messages (which the old tree reader refused) is now read in full while it streams;
+    // the newest AlertMerge.MAX_KEPT are kept and the fetch says it is truncated.
+    @Test fun aLargeMessageStoreIsStreamedAndKeepsTheNewestWithTheTrueCount() = runBlocking {
         largeMessageStore = true; sinceMessages = mapOf("ref-new" to message)
         val fetch = XapiGateway { 1_800_000_000_000L }.alerts(profile, "pool-id", null)
+        assertEquals(listOf("session.login_with_password", "pool.get_all_records", "message.get_all_records", "pool.get_all_records", "session.logout"), calls.toList())
+        assertTrue(fetch.full); assertTrue(fetch.truncated)
+        assertEquals(AlertMerge.MAX_KEPT, fetch.messages.size)
+        calls.clear()
+        val activity = XapiGateway { 1_800_000_000_000L }.activity(profile, "pool-id")
+        assertEquals(4000, activity.alerts.total); assertEquals(100, activity.alerts.items.size); assertNull(activity.alerts.issue)
+    }
+    @Test fun aMessageStoreTooLargeToParseFallsBackToTheRecentWindowAndSaysSo() = runBlocking {
+        largeMessageStore = true; sinceMessages = mapOf("ref-new" to message)
+        // inventory scale: shrink the stream limit so that the 4,000-message answer is over it, as a far larger store would be
+        val gateway = XapiGateway { 1_800_000_000_000L }.apply { streamLimits = StreamLimits.DEFAULT.copy(maxBytes = 64 * 1024) }
+        val fetch = gateway.alerts(profile, "pool-id", null)
         assertEquals(listOf("session.login_with_password", "pool.get_all_records", "message.get_all_records", "message.get_since", "pool.get_all_records", "session.logout"), calls.toList())
         assertFalse(fetch.full); assertTrue(fetch.truncated)
         assertEquals(listOf("ref-new"), fetch.messages.map { it.ref })
         assertTrue(bodies[calls.indexOf("message.get_since")].contains("<dateTime.iso8601>20270112T08:00:00Z</dateTime.iso8601>"))   // now minus three days
+        // inventory scale: pool activity shares the read and its fallback, and says the store's size is unknown
+        calls.clear()
+        val activity = gateway.activity(profile, "pool-id")
+        assertEquals(MessageWindow.TOTAL_UNKNOWN, activity.alerts.total); assertEquals(listOf("u-new"), activity.alerts.items.map { it.uuid })
     }
     @Test fun alertReadsKeepTheirIdentityChecksAndNeverWrite() = runBlocking {
         assertTrue(runCatching { XapiGateway().alerts(profile, "other-pool", null) }.isFailure)

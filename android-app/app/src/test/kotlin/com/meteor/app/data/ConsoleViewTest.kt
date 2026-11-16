@@ -124,4 +124,23 @@ class ConsoleViewTest {
         assertTrue("The cropped destination stays near the view size", region.dstWidth < 1080f + 2 * zoomed.scale)
         assertEquals(region.srcWidth * zoomed.scale, region.dstWidth, 1e-2f)
     }
+
+    // ---- zoom and pan across rotation ----
+
+    @Test fun zoomAndPanSurviveARotationAndAreClampedToTheNewView() {
+        val zoomed = ViewTransform().withViewport(400f, 800f).withFrame(1000, 500).zoomBy(2f, 100f, 100f).panBy(-50f, -30f)
+        assertFalse(zoomed.fit)
+        val restored = ViewTransform.fromSaved(zoomed.toSaved()).withViewport(800f, 400f).withFrame(1000, 500)
+        assertFalse("still zoomed after rotating", restored.fit)
+        assertEquals(zoomed.scale, restored.scale, 0.0001f)
+        assertTrue(restored.left <= 0f && restored.left >= 800f - restored.imageWidth)
+        assertTrue(restored.top <= 0f && restored.top >= 400f - restored.imageHeight)
+    }
+
+    @Test fun aFittedViewStaysFittedAndBadSavedDataGivesTheFittedView() {
+        assertTrue(ViewTransform.fromSaved(ViewTransform().toSaved()).fit)
+        assertEquals(ViewTransform(), ViewTransform.fromSaved(emptyList()))
+        assertEquals(ViewTransform(), ViewTransform.fromSaved(listOf(0f, Float.NaN, 0f, 0f)))
+        assertEquals(ViewTransform.MAX_ZOOM, ViewTransform.fromSaved(listOf(0f, 99f, 0f, 0f)).zoom, 0f)
+    }
 }

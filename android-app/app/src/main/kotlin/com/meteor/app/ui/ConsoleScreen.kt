@@ -16,6 +16,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material3.*
 import androidx.compose.runtime.*
+import androidx.compose.runtime.saveable.listSaver
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
@@ -48,27 +49,37 @@ import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.meteor.app.ConsoleController
+import com.meteor.app.ConsoleKind
 import com.meteor.app.ConsolePhase
+import com.meteor.app.ConsoleWording
 import com.meteor.app.ConsoleUiState
 import com.meteor.app.MemberTrustReview
 import com.meteor.app.MeteorViewModel
 import com.meteor.app.data.ConsoleFailureKind
 import com.meteor.app.data.ConsoleModifier
+import com.meteor.app.data.ConsolePaste
 import com.meteor.app.data.Framebuffer
-import com.meteor.app.data.KeySyms
+import com.meteor.app.data.RfbProtocol
 import com.meteor.app.data.ViewTransform
 import kotlinx.coroutines.delay
 import java.text.DateFormat
 import java.util.Date
 import kotlin.math.roundToInt
 
-/** The immersive console for a [Destination.Console]. The session itself lives in [MeteorViewModel.console]. */
+/**
+ * The immersive console for a [Destination.Console], of a VM or of an XCP-ng host. The session itself lives in
+ * [MeteorViewModel.console]. Nothing on this screen is journaled or sends a VM or host operation: it only draws the
+ * console and, when input is on, sends key and pointer events into it.
+ */
 @Composable
 fun ConsoleHost(destination: Destination.Console, model: MeteorViewModel, leave: () -> Unit) {
-    ConsoleScreen(model.console, destination.vmName, leave)
+    ConsoleScreen(model.console, if (destination.host) ConsoleKind.HOST else ConsoleKind.VM, destination.vmName, leave, model::leaveConsoleForDetails)
 }
 
 private enum class ConsoleDialog { LEAVE, CTRL_ALT_DEL, PASTE }
+
+/** Zoom and pan survive rotation (the activity is recreated); the view size and guest size are measured again. */
+private val ViewTransformSaver = listSaver<ViewTransform, Float>(save = { it.toSaved() }, restore = { ViewTransform.fromSaved(it) })
 
 /** Copies changed guest regions into one bitmap on the UI thread. A new view starts with a full copy. */
 private class FrameUploader {
@@ -95,7 +106,9 @@ private const val FRAME_INTERVAL_MILLIS = 33L
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-internal fun ConsoleScreen(controller: ConsoleController, title: String, leave: () -> Unit) {
+internal fun ConsoleScreen(controller: ConsoleController, kind: ConsoleKind, name: String, leave: () -> Unit, showDetails: () -> Unit = leave) {
+    val title = ConsoleWording.title(kind, name)
+    val ctrlAltDel = ConsoleWording.offersCtrlAltDel(kind)
     val state by controller.state.collectAsStateWithLifecycle()
     val modifiers by controller.input.modifiers.collectAsStateWithLifecycle()
     val view = LocalView.current
@@ -109,7 +122,8 @@ internal fun ConsoleScreen(controller: ConsoleController, title: String, leave: 
     var keyBar by rememberSaveable { mutableStateOf(false) }
     var touchMode by rememberSaveable { mutableStateOf(TouchMode.MOUSE) }
     var doubleTapZoom by rememberSaveable { mutableStateOf(true) }
-    var transform by remember { mutableStateOf(ViewTransform()) }
+    var transform by rememberSaveable(stateSaver = ViewTransformSaver) { mutableStateOf(ViewTransform()) }
+    var middleArmed by remember { mutableStateOf(false) }
     var dialog by remember { mutableStateOf<ConsoleDialog?>(null) }
     val uploader = remember { FrameUploader() }
     val rootFocus = remember { FocusRequester() }
@@ -155,7 +169,8 @@ internal fun ConsoleScreen(controller: ConsoleController, title: String, leave: 
 
     val gestures = remember(controller) {
         ConsoleGestureHost(transform = { transform }, setTransform = { transform = it }, input = controller.input,
-            mode = { touchMode }, doubleTapZoom = { doubleTapZoom }, haptic = { haptics.performHapticFeedback(HapticFeedbackType.LongPress) })
+            mode = { touchMode }, doubleTapZoom = { doubleTapZoom }, haptic = { haptics.performHapticFeedback(HapticFeedbackType.LongPress) },
+            tapButton = { if (middleArmed) { middleArmed = false; RfbProtocol.MIDDLE } else RfbProtocol.LEFT })
     }
 
     Box(Modifier.fillMaxSize().background(Color.Black).focusRequester(rootFocus).focusable()
@@ -164,7 +179,7 @@ internal fun ConsoleScreen(controller: ConsoleController, title: String, leave: 
         // and takes the top one itself only while the toolbar is hidden, so the picture stays as immersive as before.
         Column(Modifier.fillMaxSize()) {
             if (chrome) {
-                ConsoleToolbar(title, state, modifiers.any, touchMode, keyBar, imeVisible, transform, doubleTapZoom,
+                ConsoleToolbar(title, kind, state, modifiers.any, touchMode, keyBar, imeVisible, transform, doubleTapZoom,
                     onClose = requestLeave,
                     onKeys = { keyBar = !keyBar },
                     onKeyboard = {
@@ -174,12 +189,12 @@ internal fun ConsoleScreen(controller: ConsoleController, title: String, leave: 
                     onFit = { transform = if (transform.fit) transform.toggleActualSize(transform.viewWidth / 2f, transform.viewHeight / 2f) else transform.fitToScreen() },
                     onViewOnly = { controller.setViewOnly(!state.viewOnly) },
                     onPaste = { dialog = ConsoleDialog.PASTE },
-                    onCtrlAltDel = { dialog = ConsoleDialog.CTRL_ALT_DEL },
+                    onCtrlAltDel = if (ctrlAltDel) ({ dialog = ConsoleDialog.CTRL_ALT_DEL }) else null,
                     onDoubleTap = { doubleTapZoom = !doubleTapZoom },
                     onReconnect = controller::reconnect,
                     onHide = { chrome = false })
                 if (keyBar) ConsoleKeyBar(connected && !state.viewOnly, modifiers, controller.input::toggle, controller.input::press,
-                    { dialog = ConsoleDialog.CTRL_ALT_DEL },
+                    if (ctrlAltDel) ({ dialog = ConsoleDialog.CTRL_ALT_DEL }) else null, middleArmed, { middleArmed = !middleArmed },
                     Modifier.fillMaxWidth().windowInsetsPadding(WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)).padding(vertical = 2.dp))
             }
             Box(Modifier.weight(1f).fillMaxWidth().windowInsetsPadding(WindowInsets.safeDrawing.only(
@@ -188,7 +203,8 @@ internal fun ConsoleScreen(controller: ConsoleController, title: String, leave: 
                 Canvas(Modifier.fillMaxSize().alpha(if (state.phase == ConsolePhase.FAILED) .35f else 1f)
                     .semantics { contentDescription = "Console of $title" }
                     .onSizeChanged { transform = transform.withViewport(it.width.toFloat(), it.height.toFloat()) }
-                    .pointerInput(gestures) { consoleGestures(gestures) }) {
+                    .pointerInput(gestures) { consoleGestures(gestures) }
+                    .pointerInput(gestures) { consoleMouse(gestures) }) {
                     uploader.version // Read so a new frame redraws the canvas.
                     val bitmap = image ?: return@Canvas
                     val region = transform.visibleRegion() ?: return@Canvas
@@ -197,26 +213,31 @@ internal fun ConsoleScreen(controller: ConsoleController, title: String, leave: 
                         IntSize(region.dstWidth.roundToInt().coerceAtLeast(1), region.dstHeight.roundToInt().coerceAtLeast(1)),
                         filterQuality = if (transform.scale >= 1f) FilterQuality.None else FilterQuality.Medium)
                 }
-                ConsoleStatus(state, onReconnect = controller::reconnect, onClose = requestLeave)
+                ConsoleStatus(state, kind, onReconnect = controller::reconnect, onCancelReconnect = controller::cancelAutoReconnect, onClose = requestLeave, onDetails = showDetails)
+                PasteProgress(state, onStop = controller::cancelPaste)
             }
         }
         if (!chrome) TextButton(onClick = { chrome = true }, modifier = Modifier.align(Alignment.TopEnd).safeDrawingPadding().alpha(.7f)) { Text("Controls") }
         SoftKeyboardField(softFocus, { backspaces, text -> applySoftKeyboardEdit(controller.input, backspaces, text) }, Modifier.align(Alignment.TopStart))
     }
 
+    if (state.confirmHostInput) AlertDialog(onDismissRequest = controller::declineHostInput,
+        title = { Text(ConsoleWording.CONFIRM_INPUT_TITLE) }, text = { Text(ConsoleWording.confirmInputText(name)) },
+        confirmButton = { TextButton(onClick = controller::confirmHostInput, enabled = connected) { Text("Turn input on") } },
+        dismissButton = { TextButton(onClick = controller::declineHostInput) { Text("Keep view only") } })
     state.review?.let { review ->
-        MemberTrustDialog(review, state.trustBusy, onTrust = controller::approveMemberTrust, onCancel = controller::declineMemberTrust)
+        MemberTrustDialog(review, kind, state.trustBusy, onTrust = controller::approveMemberTrust, onCancel = controller::declineMemberTrust)
     }
     when (dialog) {
         ConsoleDialog.LEAVE -> AlertDialog(onDismissRequest = { dialog = null }, title = { Text("Leave the console?") },
-            text = { Text("A key or mouse button is still held down in the VM. Leaving releases it first.") },
+            text = { Text(ConsoleWording.leaveText(kind)) },
             confirmButton = { TextButton(onClick = { dialog = null; leave() }) { Text("Release and leave") } },
             dismissButton = { TextButton(onClick = { dialog = null }) { Text("Stay") } })
-        ConsoleDialog.CTRL_ALT_DEL -> AlertDialog(onDismissRequest = { dialog = null }, title = { Text("Send Ctrl+Alt+Del?") },
+        ConsoleDialog.CTRL_ALT_DEL -> if (ctrlAltDel) AlertDialog(onDismissRequest = { dialog = null }, title = { Text("Send Ctrl+Alt+Del?") },
             text = { Text("This sends the three keys to ${title} as a key sequence. What happens depends on the guest: Windows shows its security screen, some Linux guests reboot. It is not an XCP-ng reboot command and nothing is recorded as a power action.") },
             confirmButton = { TextButton(onClick = { dialog = null; controller.input.ctrlAltDel() }, enabled = connected && !state.viewOnly) { Text("Send") } },
-            dismissButton = { TextButton(onClick = { dialog = null }) { Text("Cancel") } })
-        ConsoleDialog.PASTE -> PasteDialog(context, enabled = connected && !state.viewOnly, pasting = state.pasting,
+            dismissButton = { TextButton(onClick = { dialog = null }) { Text("Cancel") } }) else dialog = null
+        ConsoleDialog.PASTE -> PasteDialog(context, kind, enabled = connected && !state.viewOnly, pasting = state.pasting,
             onSend = { text -> dialog = null; controller.paste(text) }, onStop = controller::cancelPaste, onDismiss = { dialog = null })
         null -> Unit
     }
@@ -233,9 +254,9 @@ private fun toolbarInsets(): WindowInsets = WindowInsets.safeDrawing.union(Windo
     .union(WindowInsets.statusBarsIgnoringVisibility).only(WindowInsetsSides.Top + WindowInsetsSides.Horizontal)
 
 @Composable
-private fun ConsoleToolbar(title: String, state: ConsoleUiState, modifierActive: Boolean, mode: TouchMode, keysOpen: Boolean, imeVisible: Boolean,
+private fun ConsoleToolbar(title: String, kind: ConsoleKind, state: ConsoleUiState, modifierActive: Boolean, mode: TouchMode, keysOpen: Boolean, imeVisible: Boolean,
     transform: ViewTransform, doubleTapZoom: Boolean, onClose: () -> Unit, onKeys: () -> Unit, onKeyboard: () -> Unit, onMode: () -> Unit,
-    onFit: () -> Unit, onViewOnly: () -> Unit, onPaste: () -> Unit, onCtrlAltDel: () -> Unit, onDoubleTap: () -> Unit,
+    onFit: () -> Unit, onViewOnly: () -> Unit, onPaste: () -> Unit, onCtrlAltDel: (() -> Unit)?, onDoubleTap: () -> Unit,
     onReconnect: () -> Unit, onHide: () -> Unit) {
     val connected = state.phase == ConsolePhase.CONNECTED
     var menu by remember { mutableStateOf(false) }
@@ -249,12 +270,12 @@ private fun ConsoleToolbar(title: String, state: ConsoleUiState, modifierActive:
             Column(Modifier.widthIn(max = 170.dp)) {
                 Text(title, style = MaterialTheme.typography.labelLarge, fontWeight = FontWeight.SemiBold, maxLines = 1)
                 Text(when {
+                    state.autoReconnect != null -> "Reconnecting…"
                     state.phase == ConsolePhase.CONNECTING -> "Connecting…"
                     state.phase == ConsolePhase.FAILED -> "Disconnected"
                     state.phase == ConsolePhase.IDLE -> "Closed"
                     state.viewOnly -> "View only"
-                    modifierActive -> "Modifier held · typing goes to the VM"
-                    else -> "Typing goes to the VM"
+                    else -> ConsoleWording.typingStatus(kind, modifierActive)
                 }, style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant, maxLines = 1)
             }
             FilterChip(selected = keysOpen, onClick = onKeys, label = { Text("Keys") })
@@ -267,7 +288,8 @@ private fun ConsoleToolbar(title: String, state: ConsoleUiState, modifierActive:
                 TextButton(onClick = { menu = true }) { Text("More") }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     DropdownMenuItem(text = { Text("Paste text…") }, enabled = connected && !state.viewOnly, onClick = { menu = false; onPaste() })
-                    DropdownMenuItem(text = { Text("Ctrl+Alt+Del…") }, enabled = connected && !state.viewOnly, onClick = { menu = false; onCtrlAltDel() })
+                    if (onCtrlAltDel != null) DropdownMenuItem(text = { Text("Ctrl+Alt+Del…") }, enabled = connected && !state.viewOnly,
+                        onClick = { menu = false; onCtrlAltDel() })
                     DropdownMenuItem(text = { Text(if (doubleTapZoom) "Double tap: zoom (switch to double-click)" else "Double tap: double-click (switch to zoom)") },
                         onClick = { menu = false; onDoubleTap() })
                     DropdownMenuItem(text = { Text("Reconnect") }, enabled = state.phase != ConsolePhase.CONNECTING && state.target != null,
@@ -280,8 +302,9 @@ private fun ConsoleToolbar(title: String, state: ConsoleUiState, modifierActive:
 }
 
 /** Connecting, failed and closed states, drawn over the (dimmed) last frame. */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun BoxScope.ConsoleStatus(state: ConsoleUiState, onReconnect: () -> Unit, onClose: () -> Unit) {
+private fun BoxScope.ConsoleStatus(state: ConsoleUiState, kind: ConsoleKind, onReconnect: () -> Unit, onCancelReconnect: () -> Unit, onClose: () -> Unit, onDetails: () -> Unit) {
     if (state.phase == ConsolePhase.CONNECTED) return
     Surface(Modifier.align(Alignment.Center).padding(24.dp).widthIn(max = 420.dp), shape = RoundedCornerShape(20.dp),
         color = MaterialTheme.colorScheme.surface.copy(alpha = .96f), tonalElevation = 3.dp) {
@@ -290,13 +313,21 @@ private fun BoxScope.ConsoleStatus(state: ConsoleUiState, onReconnect: () -> Uni
                 ConsolePhase.CONNECTING -> {
                     CircularProgressIndicator()
                     Text(state.message ?: "Connecting to the console…")
+                    if (state.autoReconnect != null) TextButton(onClick = onCancelReconnect) { Text("Cancel") }
                 }
                 ConsolePhase.FAILED -> {
-                    Text(failureTitle(state.failure), style = MaterialTheme.typography.titleMedium)
+                    Text(ConsoleWording.failureTitle(state.failure, kind), style = MaterialTheme.typography.titleMedium)
                     Text(state.message ?: "The console is not connected.", style = MaterialTheme.typography.bodyMedium)
-                    failureHint(state.failure)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
-                    Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-                        Button(onClick = onReconnect) { Text(if (state.failure == ConsoleFailureKind.MEMBER_TRUST) "Review certificate" else "Reconnect") }
+                    ConsoleWording.failureHint(state.failure, kind)?.let { Text(it, style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.onSurfaceVariant) }
+                    // A VM that has no console to open (not running, no RFB console, unsupported) gets its details as the main way out:
+                    // they show its state and what can be done. Reconnecting only makes sense when trying again could help.
+                    // A host console has no VM details behind it, so it keeps Reconnect and Close only.
+                    val vm = kind == ConsoleKind.VM
+                    val retryable = !vm || (state.failure != ConsoleFailureKind.NOT_RUNNING && state.failure != ConsoleFailureKind.NO_CONSOLE &&
+                        state.failure != ConsoleFailureKind.UNSUPPORTED)
+                    FlowRow(horizontalArrangement = Arrangement.spacedBy(8.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                        if (retryable) Button(onClick = onReconnect) { Text(if (state.failure == ConsoleFailureKind.MEMBER_TRUST) "Review certificate" else "Reconnect") }
+                        if (vm) { if (retryable) TextButton(onClick = onDetails) { Text("Open details") } else Button(onClick = onDetails) { Text("Open details") } }
                         TextButton(onClick = onClose) { Text("Close console") }
                     }
                 }
@@ -309,36 +340,30 @@ private fun BoxScope.ConsoleStatus(state: ConsoleUiState, onReconnect: () -> Uni
     }
 }
 
-private fun failureTitle(kind: ConsoleFailureKind?) = when (kind) {
-    ConsoleFailureKind.NOT_RUNNING -> "VM is not running"
-    ConsoleFailureKind.NO_CONSOLE -> "No console available"
-    ConsoleFailureKind.MEMBER_TRUST -> "Pool member not trusted yet"
-    ConsoleFailureKind.CERTIFICATE -> "Certificate mismatch"
-    ConsoleFailureKind.AUTH -> "Access refused"
-    ConsoleFailureKind.NETWORK -> "Host unreachable"
-    ConsoleFailureKind.TIMEOUT -> "Timed out"
-    ConsoleFailureKind.LOST -> "Connection lost"
-    ConsoleFailureKind.BACKGROUND -> "Console closed in the background"
-    ConsoleFailureKind.PROTOCOL -> "Console data could not be read"
-    ConsoleFailureKind.UNSUPPORTED -> "Console not supported"
-    ConsoleFailureKind.FAILED, null -> "Console unavailable"
-}
-
-private fun failureHint(kind: ConsoleFailureKind?): String? = when (kind) {
-    ConsoleFailureKind.CERTIFICATE -> "If the server certificate was renewed, open Connect and review its fingerprint before trusting it again."
-    ConsoleFailureKind.NETWORK, ConsoleFailureKind.TIMEOUT, ConsoleFailureKind.LOST ->
-        "The console needs a direct network path from this device to the host that runs the VM, which can be a pool member."
-    ConsoleFailureKind.PROTOCOL -> "Reconnect retries in compatibility mode, which uses uncompressed encodings only."
-    ConsoleFailureKind.MEMBER_TRUST -> "The VM runs on a pool member. Nothing was sent to that host."
-    else -> null
+/** Shown over the picture while pasted text is being typed, so a paste is visible after its dialog has closed. */
+@Composable
+private fun BoxScope.PasteProgress(state: ConsoleUiState, onStop: () -> Unit) {
+    if (!state.pasting) return
+    Surface(Modifier.align(Alignment.BottomCenter).padding(16.dp).widthIn(max = 420.dp), shape = RoundedCornerShape(16.dp),
+        color = MaterialTheme.colorScheme.surface.copy(alpha = .94f), tonalElevation = 3.dp) {
+        Row(Modifier.padding(start = 16.dp, end = 8.dp, top = 6.dp, bottom = 6.dp), verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            Column(Modifier.weight(1f, fill = false), verticalArrangement = Arrangement.spacedBy(4.dp)) {
+                Text("Typing pasted text… ${state.pasteDone} of ${state.pasteTotal}", style = MaterialTheme.typography.bodyMedium)
+                if (state.pasteSkipped > 0) Text("${state.pasteSkipped} skipped: not on a US keyboard", style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant)
+            }
+            TextButton(onClick = onStop) { Text("Stop") }
+        }
+    }
 }
 
 @Composable
-private fun MemberTrustDialog(review: MemberTrustReview, busy: Boolean, onTrust: () -> Unit, onCancel: () -> Unit) {
+private fun MemberTrustDialog(review: MemberTrustReview, kind: ConsoleKind, busy: Boolean, onTrust: () -> Unit, onCancel: () -> Unit) {
     var verified by remember(review) { mutableStateOf(false) }
-    AlertDialog(onDismissRequest = onCancel, title = { Text("Trust this pool member?") }, text = {
+    AlertDialog(onDismissRequest = { if (!busy) onCancel() }, title = { Text("Trust this pool member?") }, text = {
         Column(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState()), verticalArrangement = Arrangement.spacedBy(12.dp)) {
-            Text("This VM's console is served by ${review.authority}, a pool member. Its certificate differs from the pool coordinator's saved pin, so Meteor needs your approval before it sends the console session to that host.")
+            Text(ConsoleWording.memberTrustIntro(kind, review.authority))
             if (review.previousPin != null) Text("This host was trusted before but now presents a different certificate. Verify the change independently.")
             Text(review.certificate.subject, style = MaterialTheme.typography.bodySmall)
             val dates = DateFormat.getDateInstance()
@@ -352,15 +377,16 @@ private fun MemberTrustDialog(review: MemberTrustReview, busy: Boolean, onTrust:
             }
         }
     }, confirmButton = { TextButton(onClick = onTrust, enabled = verified && !busy) { Text("Trust and connect") } },
-        dismissButton = { TextButton(onClick = onCancel) { Text("Cancel") } })
+        dismissButton = { TextButton(onClick = onCancel, enabled = !busy) { Text("Cancel") } })
 }
 
 @Composable
-private fun PasteDialog(context: Context, enabled: Boolean, pasting: Boolean, onSend: (String) -> Unit, onStop: () -> Unit, onDismiss: () -> Unit) {
+private fun PasteDialog(context: Context, kind: ConsoleKind, enabled: Boolean, pasting: Boolean, onSend: (String) -> Unit, onStop: () -> Unit, onDismiss: () -> Unit) {
     var text by remember { mutableStateOf("") }
+    val plan = remember(text) { ConsolePaste.plan(text) }
     AlertDialog(onDismissRequest = onDismiss, title = { Text("Paste text") }, text = {
         Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("The text is typed into the VM as key presses (US layout), not sent as a clipboard.", style = MaterialTheme.typography.bodySmall)
+            Text("The text is typed into ${if (kind == ConsoleKind.HOST) "the host's console" else "the VM"} as key presses (US layout), not sent as a clipboard.", style = MaterialTheme.typography.bodySmall)
             OutlinedTextField(text, { text = it.take(ConsoleController.MAX_PASTE_CHARS) }, label = { Text("Text to type") },
                 modifier = Modifier.fillMaxWidth().heightIn(max = 220.dp), minLines = 3)
             TextButton(onClick = {
@@ -368,10 +394,13 @@ private fun PasteDialog(context: Context, enabled: Boolean, pasting: Boolean, on
                 val pasted = clipboard?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(context)?.toString()
                 if (!pasted.isNullOrEmpty()) text = pasted.take(ConsoleController.MAX_PASTE_CHARS)
             }) { Text("Use device clipboard") }
+            if (plan.skipped > 0) Text(
+                "${plan.skipped} ${if (plan.skipped == 1) "character is" else "characters are"} not on a US keyboard and will be skipped. ${plan.typed.size} will be typed.",
+                style = MaterialTheme.typography.bodySmall, color = MaterialTheme.colorScheme.error)
             if (pasting) Text("Typing in progress…", style = MaterialTheme.typography.bodySmall)
         }
     }, confirmButton = {
         if (pasting) TextButton(onClick = onStop) { Text("Stop typing") }
-        else TextButton(onClick = { onSend(text) }, enabled = enabled && text.isNotEmpty()) { Text("Type into VM") }
+        else TextButton(onClick = { onSend(text) }, enabled = enabled && plan.typed.isNotEmpty()) { Text(if (kind == ConsoleKind.HOST) "Type into host" else "Type into VM") }
     }, dismissButton = { TextButton(onClick = onDismiss) { Text("Close") } })
 }

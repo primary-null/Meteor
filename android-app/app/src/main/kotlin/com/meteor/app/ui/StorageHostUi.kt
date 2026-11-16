@@ -154,7 +154,7 @@ private fun confirmationTitle(confirmation: TargetConfirmation): String {
             request.catalog.isos.forEach { iso ->
                 ActionButton("${iso.name}\n${iso.srName}", { onPick(iso) }, enabled = enabled)
             }
-            if (request.catalog.truncated) Text("Only the first ${request.catalog.isos.size} images are listed.", style = MaterialTheme.typography.bodySmall)
+            if (request.catalog.truncated) Text("Only the first ${request.catalog.isos.size} of ${request.catalog.total} images (by name) are listed.", style = MaterialTheme.typography.bodySmall)
         }
     }, confirmButton = { TextButton(onClick = onDismiss) { Text("Cancel") } })
 }

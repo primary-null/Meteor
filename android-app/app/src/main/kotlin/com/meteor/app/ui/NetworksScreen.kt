@@ -72,5 +72,6 @@ private fun NetworkCard(network: NetworkInfo) {
                 if (pif.ip.isNotBlank()) append(" · ${pif.ip}")
             }, style = MaterialTheme.typography.bodySmall)
         }
+        if (network.pifTotal > network.pifs.size) Text("Showing ${network.pifs.size} of ${network.pifTotal} host interfaces.", style = MaterialTheme.typography.bodySmall) // inventory scale
     }
 }

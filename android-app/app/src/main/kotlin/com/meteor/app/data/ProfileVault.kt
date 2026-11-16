@@ -5,11 +5,13 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.AtomicFile
 import com.meteor.app.BuildConfig
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.File
+import java.io.IOException
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.security.KeyStore
@@ -32,6 +34,13 @@ interface ProfileStorage {
     suspend fun load(): ProfileDocument
     suspend fun save(document: ProfileDocument)
     suspend fun importDebugBootstrap(context: Context): Boolean = false
+    // --- vault recovery ---
+    /**
+     * Sets the unreadable vault aside (renamed, never deleted), replaces its key and leaves an empty, writable vault. Never touches
+     * the operation journal. Returns true when a file was set aside. Implemented by [ProfileVault] only.
+     */
+    suspend fun startOver(): Boolean = throw UnsupportedOperationException("This storage cannot start over.")
+    // --- end vault recovery ---
 }
 
 class ProfileVault(
@@ -45,6 +54,9 @@ class ProfileVault(
     private fun key(): SecretKey {
         val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
         (store.getKey(alias, null) as? SecretKey)?.let { return it }
+        return generateKey()
+    }
+    private fun generateKey(): SecretKey {
         return KeyGenerator.getInstance(KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore").apply {
             init(KeyGenParameterSpec.Builder(alias, KeyProperties.PURPOSE_ENCRYPT or KeyProperties.PURPOSE_DECRYPT)
                 .setKeySize(256).setBlockModes(KeyProperties.BLOCK_MODE_GCM)
@@ -59,35 +71,56 @@ class ProfileVault(
     private fun json(profile: Profile) = JSONObject(ProfileCodec.toMap(profile))
     // --- end B1 console ---
 
+    // --- vault recovery --- load() reports why it failed as a [VaultException] (see [VaultFailure]) and never creates a key:
+    // a lost key must surface as such instead of being replaced by an unrelated new one.
+    private inline fun <T> stage(failure: VaultFailure?, message: String, block: () -> T): T = try { block() }
+        catch (error: VaultException) { throw error }
+        catch (error: CancellationException) { throw error }
+        catch (error: Exception) { throw VaultException(failure ?: VaultFailures.classify(error), message, error) }
+    private fun existingKey(): SecretKey = stage(null, "The vault key could not be read.") {
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        store.getKey(alias, null) as? SecretKey ?: throw VaultException(VaultFailure.KEY_UNAVAILABLE, "The vault key is missing.")
+    }
+    // --- end vault recovery ---
+
     override suspend fun load(): ProfileDocument = withContext(Dispatchers.IO) {
         if (!file.baseFile.exists() && !File(file.baseFile.path + ".bak").exists()) return@withContext ProfileDocument()
-        val encoded = file.openRead().use { stream ->
+        val encoded = stage(null, "The vault could not be read.") { file.openRead().use { stream ->
             val output = ByteArrayOutputStream()
             val chunk = ByteArray(8192)
             while (true) {
                 val count = stream.read(chunk)
                 if (count == -1) break
-                require(output.size() + count <= 262144) { "Invalid vault size." }
+                if (output.size() + count > 262144) throw VaultException(VaultFailure.CORRUPT, "Invalid vault size.")
                 output.write(chunk, 0, count)
             }
             val bytes = output.toByteArray()
-            require(bytes.size in 30..262144) { "Invalid vault size." }
+            if (bytes.size !in 30..262144) throw VaultException(VaultFailure.CORRUPT, "Invalid vault size.")
             bytes
-        }
+        } }
         val buffer = ByteBuffer.wrap(encoded)
-        require(buffer.int == 0x4d455431) { "Unknown vault format." }
+        val magic = buffer.int
+        if (magic != VaultFailures.MAGIC) throw VaultException(
+            if (VaultFailures.isNewerMagic(magic)) VaultFailure.UNKNOWN_FORMAT else VaultFailure.CORRUPT, "Unknown vault format.")
         val iv = ByteArray(12).also { buffer.get(it) }
         val payload = ByteArray(buffer.remaining()).also { buffer.get(it) }
-        val cipher = Cipher.getInstance("AES/GCM/NoPadding")
-        cipher.init(Cipher.DECRYPT_MODE, key(), GCMParameterSpec(128, iv)); cipher.updateAAD(aad)
-        val root = JSONObject(String(cipher.doFinal(payload), Charsets.UTF_8))
-        require(root.getInt("version") == 1)
-        val list = root.getJSONArray("profiles")
-        require(list.length() <= 50)
-        val profiles = (0 until list.length()).map { profile(list.getJSONObject(it)) }
-        ProfileDocument(profiles, root.optString("selectedId").takeIf { selected ->
-            selected.isNotBlank() && profiles.any { it.id == selected }
-        })
+        val secret = existingKey()
+        val plain = stage(null, "The vault could not be unlocked.") {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, secret, GCMParameterSpec(128, iv)); cipher.updateAAD(aad)
+            cipher.doFinal(payload)
+        }
+        // The content authenticated, so a failure from here on means a format this version does not understand.
+        stage(VaultFailure.UNKNOWN_FORMAT, "The vault content is not in a supported format.") {
+            val root = JSONObject(String(plain, Charsets.UTF_8))
+            require(root.getInt("version") == 1)
+            val list = root.getJSONArray("profiles")
+            require(list.length() <= 50)
+            val profiles = (0 until list.length()).map { profile(list.getJSONObject(it)) }
+            ProfileDocument(profiles, root.optString("selectedId").takeIf { selected ->
+                selected.isNotBlank() && profiles.any { it.id == selected }
+            })
+        }
     }
 
     override suspend fun save(document: ProfileDocument) = withContext(Dispatchers.IO) {
@@ -105,6 +138,23 @@ class ProfileVault(
         try { stream.write(encoded); file.finishWrite(stream) }
         catch (error: Exception) { file.failWrite(stream); throw error }
     }
+
+    // --- vault recovery ---
+    /**
+     * For an unreadable vault: sets the file aside ([VaultQuarantine]), replaces the key and writes an empty vault that is read back.
+     * Only the vault file and its key are touched; the operation journal and every other store are untouched. If setting the file aside
+     * fails nothing has changed. After it, a crash at any point leaves "no file", which opens as an empty vault.
+     */
+    override suspend fun startOver(): Boolean = withContext(Dispatchers.IO) {
+        val moved = VaultQuarantine.setAside(file.baseFile.parentFile ?: throw IOException("No storage folder."), file.baseFile.name, System.currentTimeMillis())
+        val store = KeyStore.getInstance("AndroidKeyStore").apply { load(null) }
+        if (store.containsAlias(alias)) store.deleteEntry(alias)
+        generateKey()
+        save(ProfileDocument())
+        check(load().profiles.isEmpty()) { "The new vault could not be read back." }
+        moved
+    }
+    // --- end vault recovery ---
 
     override suspend fun importDebugBootstrap(context: Context): Boolean = withContext(Dispatchers.IO) {
         if (!BuildConfig.DEBUG) return@withContext false

@@ -50,6 +50,8 @@ internal class EventController(
 
     private fun key(current: MeteorState): Key? {
         if (!current.foreground) return null
+        // offline and reconnect: a second session would send the saved password again behind the stopped reconnect, or retry with no network.
+        if (current.offline || current.retryStop != null) return null
         val profile = current.selectedProfile ?: return null
         val authority = current.inventory?.authority ?: return null
         return Key(profile, authority)

@@ -12,6 +12,7 @@ import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import com.meteor.app.ControlGates
 import com.meteor.app.MeteorState
 import com.meteor.app.MeteorViewModel
 
@@ -38,7 +39,7 @@ fun MasterFollowDialog(state: MeteorState, model: MeteorViewModel) {
                 style = MaterialTheme.typography.bodySmall)
         }
     }, confirmButton = {
-        TextButton(onClick = model::followMaster, enabled = !state.loading && !state.profileBusy && !state.operationBusy) {
+        TextButton(onClick = model::followMaster, enabled = !state.loading && !state.profileBusy && !ControlGates.operationExclusive(state)) {
             Text("Connect to master ${offer.masterAddress}")
         }
     }, dismissButton = { TextButton(onClick = model::declineMaster) { Text("Not now") } })

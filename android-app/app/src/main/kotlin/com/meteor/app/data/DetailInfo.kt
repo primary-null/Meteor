@@ -26,6 +26,8 @@ data class VmInfo(
     val snapshotCount: Int, val snapshots: List<VmSnapshotInfo>, val cdDrives: List<VmCdDrive>,
     val memoryDynamicMin: Long?, val memoryDynamicMax: Long?, val memoryStaticMin: Long?, val memoryStaticMax: Long?,
     val vcpusMax: Int?, val vcpusAtStartup: Int?, val tags: List<String>, val observedAt: Long,
+    // --- inventory scale --- true counts behind the display caps
+    val cdDriveTotal: Int = cdDrives.size, val tagTotal: Int = tags.size,
 )
 
 object VmInfoMapper {
@@ -69,20 +71,22 @@ object VmInfoMapper {
         val snapshotInfo = snapshots.filter { it.recFlag("is_a_snapshot") && it.recText("uuid").isNotBlank() }.map {
             VmSnapshotInfo(it.recText("uuid"), it.recText("name_label").tidied(120).ifBlank { "Snapshot" }, ActivityMapper.time(it["snapshot_time"]))
         }.sortedWith(compareByDescending<VmSnapshotInfo> { it.createdAt ?: Long.MIN_VALUE }.thenBy { it.name }).take(MAX_SNAPSHOTS)
-        val cds = drives.filter { it.recText("type") == "CD" }.map { vbd ->
+        val allCds = drives.filter { it.recText("type") == "CD" }
+        val cds = allCds.map { vbd ->
             val empty = vbd.recFlag("empty")
             VmCdDrive(vbd.recText("userdevice").tidied(16).ifBlank { "?" }, empty,
                 if (empty) null else isoNames[vbd.recText("VDI")]?.tidied(160)?.ifBlank { null } ?: "Unnamed disc", vbd.recFlag("currently_attached"))
         }.sortedBy { it.device }.take(MAX_DRIVES)
         val config = vm.recMap("other_config")
         val poolConfig = pool["other_config"] as? Map<*, *>
+        val allTags = vm.recList("tags").map { it.tidied(64) }.filter { it.isNotBlank() }.distinct().sorted()
         return VmInfo(authority, uuid, vm.recText("name_description").trim().take(1000), firmware(vm), secureBoot(vm),
             (vm["VTPMs"] as? List<*>)?.isNotEmpty(), vm.recText("ha_restart_priority").trim(),
             config["auto_poweron"] == "true", poolConfig?.let { it["auto_poweron"]?.toString() == "true" },
             vm.recList("snapshots").size, snapshotInfo, cds,
             vm.recSize("memory_dynamic_min"), vm.recSize("memory_dynamic_max"), vm.recSize("memory_static_min"), vm.recSize("memory_static_max"),
             vm.recSize("VCPUs_max")?.toInt(), vm.recSize("VCPUs_at_startup")?.toInt(),
-            vm.recList("tags").map { it.tidied(64) }.filter { it.isNotBlank() }.distinct().sorted().take(MAX_TAGS), now)
+            allTags.take(MAX_TAGS), now, cdDriveTotal = allCds.size, tagTotal = allTags.size)
     }
 }
 
@@ -96,6 +100,7 @@ data class HostInfo(
     val cpuModel: String, val cpuCount: Int?, val socketCount: Int?, val cpuSpeedMhz: String?,
     val productBrand: String?, val productVersion: String?, val buildNumber: String?, val xapiVersion: String?, val xenVersion: String?,
     val managementIp: String?, val nics: List<HostNic>, val serverTimeMillis: Long?, val clockSkewMillis: Long?, val observedAt: Long,
+    val nicTotal: Int = nics.size, // inventory scale: true count behind MAX_NICS
 )
 
 private object Pifs {
@@ -121,7 +126,7 @@ object HostInfoMapper {
         val uuid = host.recText("uuid").also { require(it.isNotBlank()) { "Missing host identity." } }
         val cpu = host.recMap("cpu_info")
         val software = host.recMap("software_version")
-        val nics = pifs.map { pif ->
+        val allNics = pifs.map { pif ->
             val metrics = Pifs.carrier(pif, pifMetrics)
             HostNic(pif.recText("device").tidied(32).ifBlank { "?" }, pif.recText("MAC").tidied(32), pif.recText("IP").tidied(64),
                 pif.recFlag("management"), pif.recFlag("currently_attached"),
@@ -129,7 +134,8 @@ object HostInfoMapper {
                 metrics?.recLong("speed")?.takeIf { it > 0 },
                 metrics?.takeIf { it.containsKey("duplex") && (it.recLong("speed") ?: 0) > 0 }?.let { if (it.recFlag("duplex")) "Full" else "Half" },
                 Pifs.vlan(pif), Pifs.role(pif), pif.recFlag("physical"))
-        }.sortedWith(compareBy<HostNic> { !it.management }.thenBy { it.device }.thenBy { it.vlan ?: -1 }).take(MAX_NICS)
+        }.sortedWith(compareBy<HostNic> { !it.management }.thenBy { it.device }.thenBy { it.vlan ?: -1 })
+        val nics = allNics.take(MAX_NICS)
         val serverMillis = serverTime?.let { ActivityMapper.time(it) }
         val phoneMidpoint = phoneBefore + (phoneAfter - phoneBefore) / 2
         return HostInfo(authority, uuid, host.recText("name_label").tidied(120).ifBlank { "Unnamed host" }, host.recText("address").tidied(64),
@@ -140,14 +146,14 @@ object HostInfoMapper {
             software["build_number"]?.tidied(40)?.ifBlank { null }, software["xapi"]?.tidied(40)?.ifBlank { null },
             software["xen"]?.tidied(40)?.ifBlank { null },
             nics.firstOrNull { it.management && it.ip.isNotBlank() }?.ip ?: host.recText("address").tidied(64).ifBlank { null },
-            nics, serverMillis, serverMillis?.let { it - phoneMidpoint }, now)
+            nics, serverMillis, serverMillis?.let { it - phoneMidpoint }, now, allNics.size)
     }
 }
 
 data class NetworkPif(val hostName: String, val device: String, val vlan: Long?, val bond: BondRole, val attached: Boolean,
     val carrier: Boolean?, val ip: String)
 data class NetworkInfo(val uuid: String, val name: String, val description: String, val bridge: String, val mtu: Long?,
-    val vifCount: Int, val pifs: List<NetworkPif>) {
+    val vifCount: Int, val pifs: List<NetworkPif>, val pifTotal: Int = pifs.size) { // inventory scale: pifTotal
     val internal get() = pifs.isEmpty()
 }
 data class NetworkOverview(val authority: String, val networks: List<NetworkInfo>, val total: Int, val observedAt: Long)
@@ -162,13 +168,14 @@ object NetworkMapper {
         val ids = networks.values.map { it.recText("uuid") }
         require(ids.all { it.isNotBlank() } && ids.distinct().size == ids.size) { "Ambiguous network identity." }
         val mapped = networks.values.map { network ->
-            val attachments = network.recList("PIFs").mapNotNull { pifs[it] }.map { pif ->
+            val allAttachments = network.recList("PIFs").mapNotNull { pifs[it] }.map { pif ->
                 NetworkPif(hosts[pif.recText("host")]?.recText("name_label")?.tidied(120)?.ifBlank { null } ?: "Unknown host",
                     pif.recText("device").tidied(32).ifBlank { "?" }, Pifs.vlan(pif), Pifs.role(pif), pif.recFlag("currently_attached"),
                     Pifs.carrier(pif, pifMetrics)?.takeIf { it.containsKey("carrier") }?.recFlag("carrier"), pif.recText("IP").tidied(64))
-            }.sortedWith(compareBy<NetworkPif> { it.hostName.lowercase() }.thenBy { it.device }).take(MAX_PIFS_PER_NETWORK)
+            }.sortedWith(compareBy<NetworkPif> { it.hostName.lowercase() }.thenBy { it.device })
             NetworkInfo(network.recText("uuid"), network.recText("name_label").tidied(120).ifBlank { "Network" }, network.recText("name_description").tidied(300),
-                network.recText("bridge").tidied(40), network.recSize("MTU"), network.recList("VIFs").size, attachments)
+                network.recText("bridge").tidied(40), network.recSize("MTU"), network.recList("VIFs").size,
+                allAttachments.take(MAX_PIFS_PER_NETWORK), allAttachments.size)
         }.sortedBy { it.name.lowercase() }
         return NetworkOverview(authority, mapped.take(MAX_NETWORKS), mapped.size, now)
     }
@@ -176,7 +183,7 @@ object NetworkMapper {
 
 enum class VdiKind { DISK, SNAPSHOT, BASE_COPY }
 data class VdiInfo(val uuid: String, val name: String, val virtualSize: Long?, val physicalUtilisation: Long?,
-    val kind: VdiKind, val readOnly: Boolean, val attachedVms: List<String>)
+    val kind: VdiKind, val readOnly: Boolean, val attachedVms: List<String>, val attachedTotal: Int = attachedVms.size) // inventory scale
 /** [attached] is null when the host has no PBD for a shared repository. */
 data class SrHostLink(val hostName: String, val attached: Boolean?)
 data class StorageInfo(
@@ -216,11 +223,11 @@ object StorageMapper {
         val disks = vdis.filter { it.recText("uuid").isNotBlank() }.map { vdi ->
             val users = vdi.recList("VBDs").mapNotNull { vbds[it]?.recText("VM")?.let { ref -> vms[ref] } }
                 .filterNot { it.recFlag("is_a_snapshot") || it.recFlag("is_a_template") }
-                .map { it.recText("name_label").tidied(120).ifBlank { "Unnamed VM" } }.distinct().sorted().take(MAX_ATTACHED_NAMES)
+                .map { it.recText("name_label").tidied(120).ifBlank { "Unnamed VM" } }.distinct().sorted()
             VdiInfo(vdi.recText("uuid"), vdi.recText("name_label").tidied(120).ifBlank { "Unnamed disk" }, vdi.recSize("virtual_size"),
                 vdi.recSize("physical_utilisation"),
                 when { vdi.recFlag("is_a_snapshot") -> VdiKind.SNAPSHOT; vdi.containsKey("managed") && !vdi.recFlag("managed") -> VdiKind.BASE_COPY; else -> VdiKind.DISK },
-                vdi.recFlag("read_only"), users)
+                vdi.recFlag("read_only"), users.take(MAX_ATTACHED_NAMES), users.size)
         }.sortedWith(compareByDescending<VdiInfo> { it.virtualSize ?: -1 }.thenBy { it.name.lowercase() })
         return StorageInfo(authority, uuid, sr.recText("name_label").tidied(120).ifBlank { "Storage repository" }, sr.recText("type").tidied(40),
             sr.recText("content_type").tidied(40), shared, size, sr.recSize("physical_utilisation"), allocation,

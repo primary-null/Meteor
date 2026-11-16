@@ -12,6 +12,7 @@ import android.provider.Settings
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.work.BackoffPolicy
 import androidx.work.Constraints
 import androidx.work.CoroutineWorker
 import androidx.work.ExistingPeriodicWorkPolicy
@@ -27,8 +28,10 @@ import java.util.concurrent.TimeUnit
 // --- B3 background/summary ---
 
 /**
- * The periodic background alert check. A thin adapter: [BackgroundAlertRunner] holds the logic. It always reports
- * success, so WorkManager never retries a run (and never repeats a login); the next period is the retry.
+ * The periodic background alert check. A thin adapter: [BackgroundAlertRunner] holds the logic. It reports success, except
+ * when a transport failure or timeout asks for a quick retry: then WorkManager runs it again after a short backoff, at most
+ * [BackgroundAlerts.QUICK_RETRIES] times in a row (the runner's own gate also keeps a profile from being contacted early).
+ * Credential, certificate and server errors never ask for a retry; the next period is theirs.
  * Not expedited, never a foreground service.
  */
 class BackgroundAlertWorker(context: Context, parameters: WorkerParameters) : CoroutineWorker(context, parameters) {
@@ -36,29 +39,34 @@ class BackgroundAlertWorker(context: Context, parameters: WorkerParameters) : Co
         val context = applicationContext
         val store = BackgroundAlertDataStore(context)
         val report = try {
-            BackgroundAlertRunner(ProfileVault(context), XapiGateway(), store, SystemAlertNotifier(context)).run()
+            BackgroundAlertRunner(ProfileVault(context), XapiGateway(), store, SystemAlertNotifier(context), AlertSeenDataStore(context)).run()
         } catch (error: Exception) {
             if (error is CancellationException) throw error
+            runCatching { store.setRunNote(RunNote(System.currentTimeMillis(), RunProblem.STOPPED)) }
             null
         }
         // Nothing opted in any more (for example every opted-in profile was forgotten): stop the schedule.
         if (report != null && report.periodMinutes == null && !report.vaultUnavailable) BackgroundAlertScheduler.cancel(context)
-        return Result.success()
+        return if (report?.retryWanted == true && runAttemptCount < BackgroundAlerts.QUICK_RETRIES) Result.retry() else Result.success()
     }
 }
 
 object BackgroundAlertScheduler {
     const val WORK_NAME = "meteor-background-alerts"
 
-    /** Network required, not when the battery is low. WorkManager's minimum period is 15 minutes. */
+    /**
+     * Network required. There is deliberately no battery constraint: a check is one short read, and "battery not low" would
+     * hold back a critical alert exactly when the phone is least attended. Android's own Doze and App Standby limits still
+     * apply. WorkManager's minimum period is 15 minutes.
+     */
     fun constraints(): Constraints = Constraints.Builder()
         .setRequiredNetworkType(NetworkType.CONNECTED)
-        .setRequiresBatteryNotLow(true)
         .build()
 
     fun request(periodMinutes: Int): PeriodicWorkRequest =
         PeriodicWorkRequestBuilder<BackgroundAlertWorker>(periodMinutes.coerceAtLeast(15).toLong(), TimeUnit.MINUTES)
-            .setConstraints(constraints()).addTag(WORK_NAME).build()
+            .setConstraints(constraints()).setBackoffCriteria(BackoffPolicy.LINEAR, BackgroundAlerts.RETRY_BACKOFF_MINUTES, TimeUnit.MINUTES)
+            .addTag(WORK_NAME).build()
 
     /** One unique periodic job at the shortest opted-in interval; cancelled when nothing is opted in. */
     fun sync(context: Context, settings: Collection<AlertNotifySettings>) {
@@ -120,24 +128,45 @@ internal object AlertChannels {
 object NotificationIntents {
     const val ACTION_OPEN_ALERTS = "com.meteor.app.action.OPEN_ALERTS"
     const val EXTRA_PROFILE = "com.meteor.app.extra.PROFILE"
+    /** The time the notification was posted. The activity uses it to apply each tap once (see [NotificationTaps]). */
+    const val EXTRA_STAMP = "com.meteor.app.extra.STAMP"
     private val id = Regex("[A-Za-z0-9._:-]{1,120}")
 
     fun open(context: Context, profileId: String): PendingIntent {
         val intent = Intent(context, MainActivity::class.java).setAction(ACTION_OPEN_ALERTS).putExtra(EXTRA_PROFILE, profileId)
-            .addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
+            .putExtra(EXTRA_STAMP, System.currentTimeMillis()).addFlags(Intent.FLAG_ACTIVITY_CLEAR_TOP or Intent.FLAG_ACTIVITY_SINGLE_TOP)
         return PendingIntent.getActivity(context, "open|$profileId".hashCode(), intent, PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT)
     }
+
+    /** The post time of the notification an "open alerts" intent came from, or null for an intent without one (posted by an earlier release). */
+    fun stamp(intent: Intent?): Long? = intent?.takeIf { it.action == ACTION_OPEN_ALERTS }?.getLongExtra(EXTRA_STAMP, 0L)?.takeIf { it > 0 }
 
     /** The profile an "open alerts" intent targets, or null for any other or malformed intent. */
     fun profileId(intent: Intent?): String? = intent?.takeIf { it.action == ACTION_OPEN_ALERTS }
         ?.getStringExtra(EXTRA_PROFILE)?.takeIf { it.matches(id) }
 }
 
-/** Posts the content built by [AlertNotificationContent]. Lock screens show only a generic public version. */
-class SystemAlertNotifier(private val context: Context) : AlertNotifier {
+/**
+ * Posts the content built by [AlertNotificationContent]. Lock screens show only a generic public version.
+ *
+ * The group summary always describes what is actually in the shade: after posting, the notifier reads its own active
+ * notifications of that profile (title, text, severity and reference are kept in each one's extras), merges the new ones in
+ * (replacing a notification for the same alert, keeping at most [BackgroundAlerts.MAX_POSTED]), and builds the summary from
+ * that. Alerts that did not get a notification of their own are carried as an overflow count in the summary's extras.
+ */
+class SystemAlertNotifier(private val context: Context) : AlertNotifier, AlertNotificationCleaner {
     override val canPost: Boolean get() = NotificationAccess.allowed(context)
 
     private fun group(profileId: String) = "meteor.alerts.$profileId"
+    private fun childId(profileId: String, ref: String) = "alert|$profileId|$ref".hashCode()
+    private fun summaryId(profileId: String) = "summary|$profileId".hashCode()
+
+    private companion object {
+        const val X_REF = "com.meteor.app.extra.ALERT_REF"
+        const val X_SEVERITY = "com.meteor.app.extra.ALERT_SEVERITY"
+        const val X_OVERFLOW = "com.meteor.app.extra.ALERT_OVERFLOW"
+        const val X_POOL = "com.meteor.app.extra.ALERT_POOL"
+    }
 
     private fun publicVersion(channel: AlertChannel) = NotificationCompat.Builder(context, channel.id)
         .setSmallIcon(R.drawable.ic_stat_meteor).setContentTitle("Meteor").setContentText("New XCP-ng alert").build()
@@ -148,28 +177,77 @@ class SystemAlertNotifier(private val context: Context) : AlertNotifier {
         NotificationManagerCompat.from(context).notify(id, notification)
     }
 
+    /** This profile's alert notifications as the system reports them: (id, text) of each child, and the summary's overflow and pool. */
+    private class Shade(val children: List<Pair<Int, AlertNotificationText>>, val overflow: Int, val pool: String)
+
+    private fun shade(profileId: String): Shade {
+        val manager = context.getSystemService(NotificationManager::class.java)
+        val active = runCatching { manager?.activeNotifications?.toList() }.getOrNull().orEmpty().filter { it.notification.group == group(profileId) }
+        val children = active.filter { it.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY == 0 }.mapNotNull { sbn ->
+            val extras = sbn.notification.extras
+            val ref = extras.getString(X_REF) ?: return@mapNotNull null
+            val severity = AlertSeverity.entries.firstOrNull { it.priority == extras.getInt(X_SEVERITY, -1) } ?: return@mapNotNull null
+            sbn.id to AlertNotificationText(extras.getString(android.app.Notification.EXTRA_TITLE).orEmpty(),
+                extras.getString(android.app.Notification.EXTRA_TEXT).orEmpty(), severity, ref)
+        }
+        val summary = active.firstOrNull { it.notification.flags and android.app.Notification.FLAG_GROUP_SUMMARY != 0 }?.notification?.extras
+        return Shade(children, summary?.getInt(X_OVERFLOW, 0) ?: 0, summary?.getString(X_POOL).orEmpty())
+    }
+
+    private fun postChild(batchProfile: String, item: AlertNotificationText, tap: PendingIntent, summarised: Boolean) {
+        val channel = AlertChannels.of(item.severity)
+        notify(childId(batchProfile, item.ref), NotificationCompat.Builder(context, channel.id)
+            .setSmallIcon(R.drawable.ic_stat_meteor).setContentTitle(item.title).setContentText(item.text)
+            .setCategory(NotificationCompat.CATEGORY_STATUS).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion(channel)).setGroup(group(batchProfile))
+            .setGroupAlertBehavior(if (summarised) NotificationCompat.GROUP_ALERT_SUMMARY else NotificationCompat.GROUP_ALERT_ALL)
+            .addExtras(android.os.Bundle().apply { putString(X_REF, item.ref); putInt(X_SEVERITY, item.severity.priority) })
+            .setContentIntent(tap).setAutoCancel(true).build())
+    }
+
+    /** Posts the group summary for [children] and [overflow], or removes it when one alert or none is left. */
+    private fun postSummary(profileId: String, pool: String, children: List<AlertNotificationText>, overflow: Int, tap: PendingIntent) {
+        val summary = AlertNotificationContent.summary(pool, children, overflow)
+        if (summary == null) { NotificationManagerCompat.from(context).cancel(summaryId(profileId)); return }
+        val channel = AlertChannels.of(summary.severity)
+        val style = NotificationCompat.InboxStyle().setSummaryText(summary.summary)
+        summary.lines.forEach(style::addLine)
+        notify(summaryId(profileId), NotificationCompat.Builder(context, channel.id)
+            .setSmallIcon(R.drawable.ic_stat_meteor).setContentTitle(summary.title).setContentText(summary.lines.firstOrNull().orEmpty())
+            .setStyle(style).setNumber(summary.count).setGroup(group(profileId)).setGroupSummary(true)
+            .setCategory(NotificationCompat.CATEGORY_STATUS).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
+            .setPublicVersion(publicVersion(channel))
+            .addExtras(android.os.Bundle().apply { putInt(X_OVERFLOW, overflow); putString(X_POOL, pool) })
+            .setContentIntent(tap).setAutoCancel(true).build())
+    }
+
     override fun post(batch: AlertNotificationBatch) {
         AlertChannels.ensure(context)
         val tap = NotificationIntents.open(context, batch.profileId)
-        batch.items.forEach { item ->
-            val channel = AlertChannels.of(item.severity)
-            notify("alert|${batch.profileId}|${item.ref}".hashCode(), NotificationCompat.Builder(context, channel.id)
-                .setSmallIcon(R.drawable.ic_stat_meteor).setContentTitle(item.title).setContentText(item.text)
-                .setCategory(NotificationCompat.CATEGORY_STATUS).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setPublicVersion(publicVersion(channel)).setGroup(group(batch.profileId))
-                .setGroupAlertBehavior(NotificationCompat.GROUP_ALERT_SUMMARY.takeIf { batch.summary != null } ?: NotificationCompat.GROUP_ALERT_ALL)
-                .setContentIntent(tap).setAutoCancel(true).build())
-        }
-        batch.summary?.let { summary ->
-            val channel = AlertChannels.of(summary.severity)
-            val style = NotificationCompat.InboxStyle().setSummaryText(summary.summary)
-            summary.lines.forEach(style::addLine)
-            notify("summary|${batch.profileId}".hashCode(), NotificationCompat.Builder(context, channel.id)
-                .setSmallIcon(R.drawable.ic_stat_meteor).setContentTitle(summary.title).setContentText(summary.lines.firstOrNull().orEmpty())
-                .setStyle(style).setNumber(summary.count).setGroup(group(batch.profileId)).setGroupSummary(true)
-                .setCategory(NotificationCompat.CATEGORY_STATUS).setVisibility(NotificationCompat.VISIBILITY_PRIVATE)
-                .setPublicVersion(publicVersion(channel)).setContentIntent(tap).setAutoCancel(true).build())
-        }
+        val before = shade(batch.profileId)
+        val merged = AlertNotificationContent.merge(before.children.map { it.second }, batch.items)
+        val overflow = before.overflow + batch.overflow + merged.dropped.size
+        // With two or more alerts the children only alert through the summary.
+        val summarised = merged.kept.size + overflow >= 2
+        batch.items.filter { item -> merged.kept.any { it.ref == item.ref } }.forEach { postChild(batch.profileId, it, tap, summarised) }
+        val manager = NotificationManagerCompat.from(context)
+        merged.dropped.forEach { dropped -> before.children.firstOrNull { it.second.ref == dropped.ref }?.let { manager.cancel(it.first) } }
+        postSummary(batch.profileId, batch.pool.ifBlank { before.pool }, merged.kept, overflow, tap)
+    }
+
+    override fun clearProfile(profileId: String) {
+        val manager = context.getSystemService(NotificationManager::class.java) ?: return
+        runCatching { manager.activeNotifications.filter { it.notification.group == group(profileId) }.forEach { manager.cancel(it.id) } }
+    }
+
+    override fun clearAlerts(profileId: String, refs: Collection<String>) {
+        if (refs.isEmpty()) return
+        val manager = NotificationManagerCompat.from(context)
+        val before = shade(profileId)
+        val gone = before.children.filter { it.second.ref in refs }
+        if (gone.isEmpty()) return
+        gone.forEach { manager.cancel(it.first) }
+        postSummary(profileId, before.pool, before.children.map { it.second }.filter { it.ref !in refs }, before.overflow, NotificationIntents.open(context, profileId))
     }
 
     override fun attention(profileId: String, text: AttentionText) {

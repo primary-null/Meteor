@@ -19,7 +19,9 @@ class MeteorViewModel @JvmOverloads constructor(
     private val vault: ProfileStorage = ProfileVault(application),
     private val journal: OperationJournal = OperationJournal(application),
     inspector: CertificateInspector = ServerTrust,
+    network: NetworkMonitor = AndroidNetworkMonitor(application), // offline and reconnect
 ) : AndroidViewModel(application) {
+    private val networkMonitor = network
     private val preferences = AppearanceStore(application)
     val customIcons = CustomIcons(application)
     private val power = PowerService(gateway, journal)
@@ -38,36 +40,50 @@ class MeteorViewModel @JvmOverloads constructor(
     // --- end A1 ---
 
     private val connections: ConnectionController = ConnectionController(viewModelScope, gateway, vault, journal, inspector, mutable,
-        ::closeDetails, details::invalidate, ::openDetails, ::friendly, observations::invalidate)
+        ::closeDetails, details::invalidate, ::openDetails, ::friendly, observations::invalidate, network)
 
     // --- A4 alerts/events ---
-    private val alerts = AlertsController(viewModelScope, gateway, mutable, AlertSeenDataStore(application))
+    private val alerts = AlertsController(viewModelScope, gateway, mutable, AlertSeenDataStore(application), notifications = SystemAlertNotifier(application))
     private val events = EventController(viewModelScope, gateway, mutable, object : EventActions {
         // An event-triggered inventory read is skipped when the snapshot is already that fresh.
         override fun refreshInventory() {
             val observed = mutable.value.inventory?.observedAtMillis ?: 0
-            if (System.currentTimeMillis() - observed >= EventPolicy.MIN_REFRESH_GAP_MILLIS) connections.refresh()
+            if (System.currentTimeMillis() - observed >= EventPolicy.MIN_REFRESH_GAP_MILLIS) connections.refresh(automatic = true)
         }
         override fun refreshDetails() = this@MeteorViewModel.refreshDetails()
         override fun refreshAlerts(deletedMessages: Set<String>, full: Boolean) = alerts.onMessageEvents(deletedMessages, full)
         override fun refreshActivity() { if (mutable.value.poolActivity != null) observations.refreshActivity() }
     })
     // --- end A4 ---
+    // --- stop watching --- The running journaled operation and its "Stop watching" switch, shared by VM and storage/host writes.
+    private val runs = OperationRuns(mutable, ::publishOperation)
+    fun stopWatching() = runs.stop()
+    // --- end stop watching ---
     // --- B2 storage/host ---
     /** Snapshots, CD drives, host maintenance and PBD repair. Writes share [power] and its journal. */
     internal val storageHost = StorageHostController(viewModelScope, gateway, power, mutable, { connections.generation }, ::friendly,
-        ::publishOperation, ::recoverJournalAfterError, ::refresh)
+        ::publishOperation, ::recoverJournalAfterError, ::refresh, runs = runs)
     // --- end B2 storage/host ---
+    // --- VM settings --- Name, tags, vCPUs, memory and start-up settings. Writes share [power] and its journal.
+    internal val vmSettings = VmSettingsController(viewModelScope, gateway, power, mutable, { connections.generation }, ::friendly,
+        ::recoverJournalAfterError, ::refresh, { refreshDetails() }, runs)
+    // --- end VM settings ---
 
     // --- B3 background/summary ---
     private val backgroundAlerts: BackgroundAlertStore = BackgroundAlertDataStore(application)
+    /** What Settings shows about the background checks: each profile's last check and the last run's note. */
+    val backgroundChecks: kotlinx.coroutines.flow.Flow<BackgroundChecks> = backgroundAlerts.checks
     private val pools = PoolSummaryController(viewModelScope, gateway, mutable, AlertSeenDataStore(application))
     private val hostUpdates = HostUpdateController(viewModelScope, gateway, mutable)
     /** Set when the user chose "Switch" for a notification's profile, so the completed connection lands on Alerts. */
     private var alertsAfterConnect: AlertsTarget? = null
     init {
         viewModelScope.launch {
-            runCatching { backgroundAlerts.settings.collect { settings -> mutable.update { it.copy(alertNotify = settings) } } }
+            try { backgroundAlerts.settings.collect { settings -> mutable.update { it.copy(alertNotify = settings) } } }
+            catch (error: Exception) {
+                if (error is CancellationException) throw error
+                mutable.update { it.copy(notice = UiNotice.error("Notification settings could not be read.")) }
+            }
         }
         // A notification's switch offer is spent once its profile is the selected one, however that happened.
         viewModelScope.launch {
@@ -78,19 +94,49 @@ class MeteorViewModel @JvmOverloads constructor(
     }
     /** Called once the vault has loaded: preferences of forgotten profiles are removed, and the schedule follows. */
     private fun backgroundProfilesLoaded() {
+        if (backgroundPruning) return // vault recovery: it can run again after a later successful open
+        backgroundPruning = true
         viewModelScope.launch {
             mutable.map { it.profiles.map { profile -> profile.id }.toSet() to it.vaultProblem }.distinctUntilChanged().collect { (ids, vaultProblem) ->
                 // Session-only profiles (unreadable vault) never prune stored preferences.
                 if (vaultProblem) return@collect
-                runCatching { backgroundAlerts.retainOnly(ids) }
+                // Housekeeping only: a failure leaves harmless old entries and the next profile change prunes again.
+                try { backgroundAlerts.retainOnly(ids) } catch (error: Exception) { if (error is CancellationException) throw error }
+                // --- vault recovery --- The in-app "alert seen" values of forgotten profiles go the same way.
+                try { alertSeen.retainOnly(ids) } catch (error: Exception) { if (error is CancellationException) throw error }
+                // --- end vault recovery ---
                 syncBackgroundSchedule()
             }
         }
     }
     private suspend fun syncBackgroundSchedule() {
-        runCatching { BackgroundAlertScheduler.sync(getApplication(), backgroundAlerts.allSettings().values) }
+        try { BackgroundAlertScheduler.sync(getApplication(), backgroundAlerts.allSettings().values) }
+        catch (error: Exception) {
+            if (error is CancellationException) throw error
+            mutable.update { it.copy(notice = UiNotice.error("Background checks could not be scheduled. Change the notification setting again to retry.")) }
+        }
     }
     // --- end B3 ---
+
+    // --- vault recovery ---
+    private val alertSeen = AlertSeenDataStore(application)
+    private var backgroundPruning = false
+    private val recovery = VaultRecoveryController(viewModelScope, vault, mutable,
+        writes = { block -> connections.withProfileWrites(block) }, allowed = connections::canRecoverVault,
+        open = { vault.importDebugBootstrap(application); vault.load() },
+        retain = { ids -> backgroundAlerts.retainOnly(ids); alertSeen.retainOnly(ids); syncBackgroundSchedule() }, opened = ::vaultOpened)
+    /** Connections screen: read the saved connections again. Transient failures recover without restarting the app. */
+    fun retryVault() = recovery.retry()
+    /** Connections screen, after the confirmation: set the unreadable vault aside and save again. The operation journal is untouched. */
+    fun startOverVault() = recovery.startOver()
+    /** The saved connections opened after an earlier failure: the steps start-up does after a good load. */
+    private fun vaultOpened(connect: Profile?) {
+        backgroundProfilesLoaded()
+        connect?.let { connections.connect(it, manual = false) }
+        // A pending action is rechecked only when its own connection is saved; otherwise the notice explains how to review it.
+        mutable.value.operation?.takeIf { it.unresolved }?.let { op -> if (mutable.value.profiles.any { it.id == op.profileId }) checkOperation() }
+    }
+    // --- end vault recovery ---
 
     init {
         // --- A4 alerts/events ---
@@ -102,36 +148,44 @@ class MeteorViewModel @JvmOverloads constructor(
         events.start()
         // --- end A4 ---
         viewModelScope.launch {
-            runCatching { preferences.flow.collect { settings -> mutable.update { it.copy(appearance = settings) } } }
-                .onFailure { mutable.update { it.copy(notice = UiNotice.error("Appearance settings could not be read.")) } }
+            try { preferences.flow.collect { settings -> mutable.update { it.copy(appearance = settings) } } }
+            catch (error: Exception) {
+                if (error is CancellationException) throw error // clearing the view model is not a read failure
+                mutable.update { it.copy(notice = UiNotice.error("Appearance settings could not be read.")) }
+            }
         }
         viewModelScope.launch {
-            runCatching {
+            val document = try {
                 vault.importDebugBootstrap(application)
                 vault.load()
-            }.onSuccess { document ->
-                mutable.update { it.copy(profiles = document.profiles, selectedId = document.selectedId) }
-                loadJournal()
-                connections.initialized = true
-                backgroundProfilesLoaded() // B3 background/summary
-                document.profiles.firstOrNull { it.id == document.selectedId }?.let { connections.connect(it, manual = false) }
-                if (mutable.value.operation?.unresolved == true) checkOperation()
-            }.onFailure {
-                mutable.update { it.copy(vaultProblem = true,
-                    notice = UiNotice.error("Saved profiles could not be opened. Existing encrypted data was preserved. New connections will be session-only.")) }
+            } catch (error: Exception) {
+                if (error is CancellationException) throw error // clearing the view model must not report an unreadable vault
+                // --- vault recovery --- The Connections screen and a banner explain it and offer Try again / Start over.
+                recovery.loadFailed(error)
+                // --- end vault recovery ---
                 // The journal is stored separately. Loading it keeps a pending action visible and
                 // reviewable from a session-only connection instead of silently locking power controls.
                 loadJournal()
                 connections.initialized = true
+                return@launch
             }
+            mutable.update { it.copy(profiles = document.profiles, selectedId = document.selectedId) }
+            loadJournal()
+            connections.initialized = true
+            backgroundProfilesLoaded() // B3 background/summary
+            document.profiles.firstOrNull { it.id == document.selectedId }?.let { connections.connect(it, manual = false) }
+            if (mutable.value.operation?.unresolved == true) checkOperation()
         }
     }
 
     private suspend fun loadJournal() {
-        runCatching { journal.load() }.onSuccess { operations ->
-            publishJournal(operations)
-        }.onFailure { mutable.update { it.copy(journalProblem = true,
-            notice = UiNotice.error("Operation history could not be opened. Power controls are locked; existing data was preserved.")) } }
+        val operations = try { journal.load() } catch (error: Exception) {
+            if (error is CancellationException) throw error
+            mutable.update { it.copy(journalProblem = true,
+                notice = UiNotice.error("Operation history could not be opened. Power controls are locked; existing data was preserved.")) }
+            return
+        }
+        publishJournal(operations)
     }
     private fun publishJournal(operations: List<PowerOperation>, expectedRevision: Long? = null) {
         mutable.update { it.withJournal(operations, expectedRevision) }
@@ -188,7 +242,14 @@ class MeteorViewModel @JvmOverloads constructor(
     // --- end A3 observability ---
     // --- A4 alerts/events ---
     /** Called from the activity lifecycle: live events run only while it is at least STARTED. */
-    fun setForeground(value: Boolean) { mutable.update { if (it.foreground == value) it else it.copy(foreground = value) } }
+    fun setForeground(value: Boolean) {
+        mutable.update { if (it.foreground == value) it else it.copy(foreground = value) }
+        // offline and reconnect: the default-network callback is registered only while the app is in the foreground.
+        if (value) networkMonitor.start() else networkMonitor.stop()
+        // --- session reuse --- the shared XAPI session is logged out after a grace period in the background
+        gateway.backgrounded(!value)
+        // --- end session reuse ---
+    }
     fun refreshAlerts() = alerts.refresh()
     /** Manual refresh: a full re-read, which also reveals deletions. */
     fun reloadAlerts() = alerts.refresh(full = true)
@@ -281,7 +342,7 @@ class MeteorViewModel @JvmOverloads constructor(
         mutable.update { it.copy(pendingPower = null, operationBusy = true) }
         viewModelScope.launch {
             try {
-                power.execute(profile, confirmation, ::publishOperation)
+                runs.run { changed -> power.execute(profile, confirmation, changed) } // stop watching
             } catch (error: Exception) {
                 recoverJournalAfterError(error)
             } finally {
@@ -304,9 +365,13 @@ class MeteorViewModel @JvmOverloads constructor(
         }
         mutable.update { it.copy(operationBusy = true, pendingPower = null) }
         viewModelScope.launch {
-            try { power.reconcile(profile, op, ::publishOperation) }
+            try { runs.run { changed -> power.reconcile(profile, op, changed) } } // stop watching
             catch (error: Exception) { recoverJournalAfterError(error) }
-            finally { mutable.update { it.copy(operationBusy = false) }; refresh(); refreshDetails() }
+            finally {
+                mutable.update { it.copy(operationBusy = false) }; refresh(); refreshDetails()
+                // A settled settings record restarts an open editor from the server's values, as a finished save does.
+                if (op.action == PowerAction.SETTINGS) vmSettings.afterRecordClosed(op.authority, op.vmUuid)
+            }
         }
     }
     fun reviewOperation() {
@@ -395,10 +460,13 @@ class MeteorViewModel @JvmOverloads constructor(
         // Explicit preconditions (expired confirmation, changed VM, pending record) explain themselves.
         val reason = (error as? IllegalArgumentException)?.message?.takeIf { it.isNotBlank() && it != "Failed requirement." }
             ?: "Action could not be completed. Review the operation status before trying again."
-        runCatching { journal.load() }.onSuccess { operations ->
-            publishJournal(operations)
-            mutable.update { it.copy(notice = UiNotice.error(reason)) }
-        }.onFailure { mutable.update { it.copy(journalProblem = true, notice = UiNotice.error("Operation history could not be read. Power controls are locked; no automatic retry will occur.")) } }
+        val operations = try { journal.load() } catch (failure: Exception) {
+            if (failure is CancellationException) throw failure // clearing the view model is not an unreadable journal
+            mutable.update { it.copy(journalProblem = true, notice = UiNotice.error("Operation history could not be read. Power controls are locked; no automatic retry will occur.")) }
+            return
+        }
+        publishJournal(operations)
+        mutable.update { it.copy(notice = UiNotice.error(reason)) }
     }
 
     fun mode(value: String) = preference { preferences.setMode(value) }
@@ -424,17 +492,30 @@ class MeteorViewModel @JvmOverloads constructor(
         if (previous != null && previous != token) customIcons.delete(previous)
     }
     private fun preference(action: suspend () -> Unit) {
-        viewModelScope.launch { runCatching { action() }.onFailure {
-            mutable.update { old -> old.copy(notice = UiNotice.error("That preference could not be saved. Try again.")) }
-        } }
+        viewModelScope.launch {
+            try { action() } catch (error: Exception) {
+                if (error is CancellationException) throw error
+                // A validation failure ("Choose an image under 3 MB.") explains itself; anything else stays generic.
+                mutable.update { old -> old.copy(notice = UiNotice.error(ErrorReasons.preference(error))) }
+            }
+        }
     }
     fun dismissMessage() { mutable.update { it.copy(notice = null) } }
 
     // --- B1 console ---
     private var consoleOrigin: String? = null
+    /**
+     * The VM (uuid, pool) whose details to show again when the console is left. Opened from the details, that is the console's own VM;
+     * opened from a fleet row beside an open detail pane, it is the VM that pane showed, so a tap never blanks or replaces the pane.
+     * Null when no details were open, so Back lands on the plain fleet.
+     */
+    private var consoleReturnTo: Pair<String, String>? = null
     /** The one open console. Held here so its session survives rotation and fold/unfold. */
     val console = ConsoleController(viewModelScope,
-        opener = { profile, target, encodings -> gateway.console(profile, target.authority, target.vmUuid, encodings) },
+        opener = { profile, target, encodings ->
+            if (target.host) gateway.hostConsole(profile, target.authority, target.vmUuid, encodings)
+            else gateway.console(profile, target.authority, target.vmUuid, encodings)
+        },
         profileOf = { id -> mutable.value.profiles.firstOrNull { it.id == id } },
         approvePin = { profileId, authority, pin -> connections.approveMemberPin(profileId, authority, pin) })
 
@@ -451,7 +532,7 @@ class MeteorViewModel @JvmOverloads constructor(
                 val now = stack.current as? com.meteor.app.ui.Destination.Console
                 if (now == null) {
                     console.close()
-                    previous?.let { left -> if (stack.current == com.meteor.app.ui.Destination.Fleet) reopenDetails(left) }
+                    if (previous != null && stack.current == com.meteor.app.ui.Destination.Fleet) consoleReturnTo?.let(::reopenDetails)
                 }
                 previous = now
             }
@@ -472,17 +553,47 @@ class MeteorViewModel @JvmOverloads constructor(
         }
     }
 
-    /** Opens the full-screen console for a VM whose details are loaded. A console never journals or sends a power action. */
-    fun openConsole(guest: Guest, detail: VmDetails) {
+    /**
+     * Opens the full-screen console for a running VM of the connected pool. It needs only the fleet row, not loaded details: the
+     * console resolves the VM itself. [fromDetails] says the details were open, so Back returns to them; opened from the fleet row,
+     * Back returns to the fleet. A console never journals or sends a power action.
+     */
+    fun openConsole(guest: Guest, fromDetails: Boolean = false) {
         val state = mutable.value
         val profile = state.selectedProfile ?: return
-        if (!state.connected || detail.uuid != guest.uuid || detail.authority != guest.poolUuid || detail.authority != state.inventory?.authority) return
-        val target = ConsoleTarget(profile.id, detail.authority, detail.uuid, detail.name)
+        if (!state.connected || guest.power != "Running" || guest.poolUuid != state.inventory?.authority) return
+        val target = ConsoleTarget(profile.id, guest.poolUuid, guest.uuid, guest.name)
         consoleOrigin = profile.origin()
+        consoleReturnTo = ConsoleReturn.target(fromDetails, guest, state.selectedGuest)
         // The details dialog would otherwise stay above the console, and its polling would keep running.
         closeDetails()
         console.open(target)
         navigator.open(com.meteor.app.ui.Destination.Console(target.profileId, target.authority, target.vmUuid, target.vmName))
+    }
+
+    /**
+     * Opens the full-screen console of an XCP-ng host itself (its control domain's screen). It always opens view-only; the
+     * controller asks before input is turned on. A host console never journals or sends a host or VM operation.
+     */
+    fun openHostConsole(host: Host) {
+        val state = mutable.value
+        val profile = state.selectedProfile ?: return
+        val inventory = state.inventory ?: return
+        if (!state.connected || inventory.hosts.none { it.uuid == host.uuid }) return
+        val target = ConsoleTarget(profile.id, inventory.authority, host.uuid, host.name, ConsoleKind.HOST)
+        consoleOrigin = profile.origin()
+        consoleReturnTo = null // leaving a host console never reopens a VM's details
+        console.open(target)
+        navigator.open(com.meteor.app.ui.Destination.Console(target.profileId, target.authority, target.vmUuid, target.vmName, host = true))
+    }
+
+    /** Read-only: whether [host] offers a console Meteor can show, for the host details' button. */
+    suspend fun hostConsoleOffer(host: Host): HostConsoleOffer? {
+        val state = mutable.value
+        val profile = state.selectedProfile ?: return null
+        val inventory = state.inventory ?: return null
+        if (!state.connected) return null
+        return gateway.hostConsoleOffer(profile, inventory.authority, host.uuid)
     }
 
     private fun closeConsoleIfStale(profile: Pair<String, String>?, authority: String?) {
@@ -494,12 +605,22 @@ class MeteorViewModel @JvmOverloads constructor(
         if (navigator.current is com.meteor.app.ui.Destination.Console) navigator.back()
     }
 
-    private fun reopenDetails(left: com.meteor.app.ui.Destination.Console) {
-        mutable.value.inventory?.guests?.firstOrNull { it.uuid == left.vmUuid && it.poolUuid == left.authority }?.let(::openDetails)
+    private fun reopenDetails(vm: Pair<String, String>) {
+        mutable.value.inventory?.guests?.firstOrNull { it.uuid == vm.first && it.poolUuid == vm.second }?.let(::openDetails)
+    }
+
+    /** From a console that failed: leave it and show the VM's details, where its state and the reason are. */
+    fun leaveConsoleForDetails() {
+        val target = console.state.value.target ?: return
+        // A host console has no VM details to return to; Overview keeps its own host selection.
+        consoleReturnTo = if (target.host) null else target.vmUuid to target.authority
+        if (navigator.current is com.meteor.app.ui.Destination.Console) navigator.back() else console.close()
     }
 
     override fun onCleared() {
+        networkMonitor.stop()
         console.shutdown()
+        gateway.releaseSession() // session reuse: best-effort logout of the shared XAPI session
         super.onCleared()
     }
     // --- end B1 console ---

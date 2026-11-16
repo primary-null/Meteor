@@ -58,6 +58,12 @@ fun MeteorApp(model: MeteorViewModel) {
             // A receipt can arrive between five-second ticks; compare it with the current clock immediately.
             now = System.currentTimeMillis()
         }
+        // D5 (first phone run): a closed card must be gone two minutes after its last update even if the five-second tick
+        // has not run. This wake-up fires at that moment, whatever the tick is doing, and the card is judged against the real clock.
+        val card = state.operation
+        LaunchedEffect(card?.id, card?.updatedAt, card?.phase, card?.manualResolution) {
+            OperationHistory.cardTimeLeft(card, System.currentTimeMillis())?.let { delay(it); now = System.currentTimeMillis() }
+        }
         val owner = LocalLifecycleOwner.current
         LaunchedEffect(owner, current) {
             owner.lifecycle.repeatOnLifecycle(Lifecycle.State.STARTED) {
@@ -122,10 +128,12 @@ fun MeteorApp(model: MeteorViewModel) {
                                 HorizontalDivider(color = colors.outlineVariant.copy(alpha = .35f))
                                 if (state.loading || state.profileBusy) LinearProgressIndicator(Modifier.fillMaxWidth())
                                 state.notice?.let { NoticeBanner(it, model::dismissMessage) }
+                                ConnectionStatus.banner(state)?.let { NoticeBanner(it, null) } // offline and reconnect: persistent, not dismissible
+                                VaultRecoveryText.banners(state, current == Destination.Connections).forEach { NoticeBanner(it, null) } // vault recovery: derived, persistent
                                 // An unresolved operation is always shown; a closed one only briefly (OperationHistory.cardVisible).
-                                // `now` is a five-second tick; a record newer than it is judged against the real clock for this frame.
-                                state.operation?.takeIf { OperationHistory.cardVisible(it, if (it.updatedAt > now) System.currentTimeMillis() else now) }?.let { operation ->
-                                    OperationCard(operation, state, model) { navigate { open(Destination.History) }; model.reloadHistory() }
+                                // `now` only makes this recompose (a five-second tick and the wake-up above); the card is judged against the real clock.
+                                state.operation?.takeIf { OperationHistory.cardVisible(it, maxOf(now, System.currentTimeMillis())) }?.let { operation ->
+                                    OperationCard(operation, state, model, now) { navigate { open(Destination.History) }; model.reloadHistory() }
                                 }
                                 DestinationContent(current, state, model, now, overviewList, fleetList, navigate, vmPerformance)
                             }
@@ -202,17 +210,19 @@ private fun Header(state: MeteorState, model: MeteorViewModel, compact: Boolean)
             Text("SPARK  /  XCP-ng", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.primary)
         }
         if (state.selectedProfile != null) TextButton(onClick = model::refresh,
-            enabled = !state.loading && !state.profileBusy && !state.operationBusy && state.editingProfileId == null && state.pendingTrust == null) { Text("Refresh") }
+            enabled = !state.loading && !state.profileBusy && !ControlGates.operationExclusive(state) && state.editingProfileId == null && state.pendingTrust == null) { Text("Refresh") }
     }
 }
 
 @Composable
-private fun OperationCard(operation: PowerOperation, state: MeteorState, model: MeteorViewModel, viewHistory: () -> Unit) {
+private fun OperationCard(operation: PowerOperation, state: MeteorState, model: MeteorViewModel, now: Long, viewHistory: () -> Unit) {
     Surface(Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 4.dp), color = MaterialTheme.colorScheme.surfaceContainer, shape = RoundedCornerShape(12.dp)) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(4.dp)) {
             Text(OperationHistory.title(operation), style = MaterialTheme.typography.labelMedium) // B2 storage/host: target-aware title
             Text(if (operation.unresolved) operation.message.ifBlank { operation.phase.name } else OperationHistory.status(operation),
                 style = MaterialTheme.typography.bodySmall)
+            OperationProgress(operation) // journaled operation hardening: server estimate while tracking
+            OperationWatching(operation, state, now, model::stopWatching) // stop watching: how long, what to expect, and the switch
             TextButton(onClick = viewHistory) { Text("View history") }
             if (operation.unresolved && !state.operationBusy) TextButton(onClick = model::checkOperation, enabled = !state.profileBusy) { Text("Check status") }
             if (operation.unresolved) {

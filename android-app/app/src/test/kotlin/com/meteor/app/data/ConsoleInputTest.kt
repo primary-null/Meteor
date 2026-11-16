@@ -1,10 +1,11 @@
 package com.meteor.app.data
 
 import android.view.KeyEvent
+import com.meteor.app.ui.applySoftKeyboardEdit
 import org.junit.Assert.*
 import org.junit.Test
 
-/** Keysym mapping, sticky modifiers, pointer and wheel events, view-only and the soft-keyboard diff. */
+/** Keysym mapping, sticky modifiers, pointer and wheel events, view-only and the soft-keyboard field rule. */
 class ConsoleInputTest {
     private sealed interface Event {
         data class Key(val keysym: Int, val down: Boolean) : Event
@@ -94,6 +95,68 @@ class ConsoleInputTest {
         input.keyEvent('a'.code, false); input.keyEvent('a'.code, false); input.keyEvent(KeySyms.SHIFT_L, false)
         assertEquals(listOf(KeySyms.SHIFT_L to true, 'a'.code to true, 'a'.code to false, KeySyms.SHIFT_L to false), sink.keys())
         assertFalse(input.anyHeld)
+    }
+
+    // ---- hardware key repeat ----
+
+    @Test fun aHeldHardwareKeyRepeatsAsFurtherKeyDownsWithoutAnUpInBetween() {
+        val (sink, input) = input()
+        input.keyEvent(KeySyms.BACKSPACE, true)
+        input.keyEvent(KeySyms.BACKSPACE, true, repeat = true)
+        input.keyEvent(KeySyms.BACKSPACE, true, repeat = true)
+        input.keyEvent(KeySyms.BACKSPACE, false)
+        assertEquals(listOf(KeySyms.BACKSPACE to true, KeySyms.BACKSPACE to true, KeySyms.BACKSPACE to true, KeySyms.BACKSPACE to false), sink.keys())
+        assertFalse(input.anyHeld)
+    }
+
+    @Test fun repeatsNeverRepeatModifiersAndAnUnrepeatedDuplicateIsStillDropped() {
+        val (sink, input) = input()
+        input.keyEvent(KeySyms.SHIFT_L, true); input.keyEvent(KeySyms.SHIFT_L, true, repeat = true)
+        input.keyEvent(KeySyms.CONTROL_R, true); input.keyEvent(KeySyms.CONTROL_R, true, repeat = true)
+        input.keyEvent(KeySyms.LEFT, true); input.keyEvent(KeySyms.LEFT, true)
+        assertEquals(listOf(KeySyms.SHIFT_L to true, KeySyms.CONTROL_R to true, KeySyms.LEFT to true), sink.keys())
+    }
+
+    @Test fun aRepeatForAKeyThatIsNotDownStartsItInsteadOfRepeating() {
+        val (sink, input) = input()
+        input.keyEvent('a'.code, true, repeat = true)
+        assertEquals(listOf('a'.code to true), sink.keys())
+        assertTrue(input.anyHeld)
+    }
+
+    @Test fun repeatsDoNotEndOneShotModifiersUntilTheKeyGoesUp() {
+        val (sink, input) = input()
+        input.toggle(ConsoleModifier.CTRL); sink.clear()
+        input.keyEvent(KeySyms.RIGHT, true); input.keyEvent(KeySyms.RIGHT, true, repeat = true)
+        assertEquals(listOf(KeySyms.RIGHT to true, KeySyms.RIGHT to true), sink.keys())
+        assertEquals(StickyMode.ARMED, input.modifiers.value.ctrl)
+        input.keyEvent(KeySyms.RIGHT, false)
+        assertEquals(KeySyms.CONTROL_L to false, sink.keys().last())
+    }
+
+    @Test fun viewOnlySendsNoRepeatsAndLeavesHardwareKeysToTheSystem() {
+        val (sink, input) = input()
+        input.keyEvent(KeySyms.DOWN, true)
+        input.viewOnly = true; sink.clear()
+        input.keyEvent(KeySyms.DOWN, true, repeat = true)
+        assertTrue(sink.events.isEmpty())
+        assertFalse("A view-only console does not consume the key", ConsoleKeys.forward(input, KeyEvent.KEYCODE_DPAD_DOWN, 0, down = true, repeat = false))
+        assertFalse(ConsoleKeys.forward(input, KeyEvent.KEYCODE_A, 'a'.code, down = true, repeat = true))
+        assertTrue(sink.events.isEmpty())
+    }
+
+    @Test fun forwardingPassesRepeatsAndUpsAndKeepsSystemKeysAndUnmappedKeysForTheSystem() {
+        val (sink, input) = input()
+        assertTrue(ConsoleKeys.forward(input, KeyEvent.KEYCODE_DEL, 0, down = true, repeat = false))
+        assertTrue(ConsoleKeys.forward(input, KeyEvent.KEYCODE_DEL, 0, down = true, repeat = true))
+        assertTrue(ConsoleKeys.forward(input, KeyEvent.KEYCODE_DEL, 0, down = false, repeat = false))
+        assertEquals(listOf(KeySyms.BACKSPACE to true, KeySyms.BACKSPACE to true, KeySyms.BACKSPACE to false), sink.keys())
+        sink.clear()
+        for (code in listOf(KeyEvent.KEYCODE_BACK, KeyEvent.KEYCODE_HOME, KeyEvent.KEYCODE_APP_SWITCH, KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN, KeyEvent.KEYCODE_POWER, KeyEvent.KEYCODE_CAMERA)) {
+            assertFalse("key $code", ConsoleKeys.forward(input, code, 0, down = true, repeat = false))
+        }
+        assertTrue(sink.events.isEmpty())
     }
 
     // ---- sticky modifiers ----
@@ -210,11 +273,109 @@ class ConsoleInputTest {
 
     // ---- soft keyboard bridge ----
 
-    @Test fun softKeyboardDiffTypesAppendedTextAndTurnsADeletedSentinelIntoBackspace() {
-        assertEquals(SoftKeyboardEdit(0, ""), SoftKeyboard.diff(SoftKeyboard.SENTINEL))
-        assertEquals(SoftKeyboardEdit(0, "a"), SoftKeyboard.diff(SoftKeyboard.SENTINEL + "a"))
-        assertEquals(SoftKeyboardEdit(0, "Hi!"), SoftKeyboard.diff(SoftKeyboard.SENTINEL + "Hi!"))
-        assertEquals(SoftKeyboardEdit(1, ""), SoftKeyboard.diff(""))
-        assertEquals("A replaced text is typed in full", SoftKeyboardEdit(1, "xyz"), SoftKeyboard.diff("xyz"))
+    /**
+     * Plays what a keyboard reports, as successive field texts, through [SoftKeyboard.step] the way the hidden field does.
+     * [resets] counts the times the field was replaced, which is what makes a real keyboard fall back to its letters.
+     */
+    private class Field {
+        var text = SoftKeyboard.PAD
+        var resets = 0
+        val edits = mutableListOf<SoftKeyboardEdit>()
+        fun change(next: String, composing: Boolean = false): SoftKeyboardEdit {
+            val step = SoftKeyboard.step(text, next, composing)
+            if (step.field != next) resets++
+            edits += step.edit; text = step.field
+            return step.edit
+        }
+        fun type(typed: String, composing: Boolean = false) = change(text + typed, composing)
+        fun backspace(count: Int = 1) = change(text.dropLast(count))
+        /** What the guest sees, with `<` for a Backspace press. */
+        fun sent() = edits.joinToString("") { "<".repeat(it.backspaces) + it.text }
+    }
+
+    @Test fun aRunOfSymbolsNeverReplacesTheFieldSoTheKeyboardKeepsItsSymbolLayout() {
+        val field = Field()
+        for (c in "@#$!?") assertEquals(SoftKeyboardEdit(0, c.toString()), field.type(c.toString()))
+        assertEquals("@#$!?", field.sent())
+        assertEquals(0, field.resets)
+        assertEquals(SoftKeyboard.PAD + "@#$!?", field.text)
+    }
+
+    @Test fun backspaceDeletesTypedTextThenPadAndTheFieldStartsOverOnlyWhenThePadIsNearlyGone() {
+        val field = Field()
+        field.type("ab")
+        assertEquals(SoftKeyboardEdit(1, ""), field.backspace()); assertEquals(SoftKeyboardEdit(1, ""), field.backspace())
+        assertEquals(0, field.resets); assertEquals(SoftKeyboard.PAD, field.text)
+        // Backspace with nothing typed still reaches the guest.
+        assertEquals(SoftKeyboardEdit(1, ""), field.backspace()); assertEquals(0, field.resets)
+        // A held Backspace: every press is sent; the field starts over once, when fewer than MIN_LENGTH characters remain.
+        val before = field.edits.size
+        repeat(SoftKeyboard.PAD_LENGTH - 1 - (SoftKeyboard.MIN_LENGTH - 1)) { field.backspace() }
+        assertEquals(1, field.resets); assertEquals(SoftKeyboard.PAD, field.text)
+        assertTrue(field.edits.drop(before).all { it == SoftKeyboardEdit(1, "") })
+        // Typing goes on normally afterwards.
+        assertEquals(SoftKeyboardEdit(0, "x"), field.type("x"))
+    }
+
+    @Test fun spaceAndEnterAreTypedAndReachTheGuest() {
+        val field = Field()
+        assertEquals(SoftKeyboardEdit(0, " "), field.type(" "))
+        assertEquals(SoftKeyboardEdit(0, "\n"), field.type("\n"))
+        val (sink, input) = input()
+        field.edits.forEach { applySoftKeyboardEdit(input, it.backspaces, it.text) }
+        assertEquals(tap(' '.code, KeySyms.RETURN), sink.keys())
+        // A keyboard that sends Space as a key event instead of text reaches the guest as the same key.
+        assertEquals(' '.code, ConsoleKeys.fromAndroid(KeyEvent.KEYCODE_SPACE, ' '.code))
+    }
+
+    @Test fun anAutocorrectThatRewritesTheEndOfAWordDeletesAndRetypesOnlyTheChangedTail() {
+        val field = Field()
+        field.type("t"); field.type("e"); field.type("h")
+        assertEquals(SoftKeyboardEdit(2, "he"), field.change(SoftKeyboard.PAD + "the"))
+        assertEquals("teh<<he", field.sent())
+        assertEquals(0, field.resets)
+    }
+
+    @Test fun aSwipedWordCommittedAtOnceAndComposedLetterByLetterBothEndAsTheSameKeys() {
+        val committed = Field(); committed.type("hello ")
+        val composed = Field()
+        listOf("h", "he", "hel", "hell", "hello").forEach { composed.change(SoftKeyboard.PAD + it, composing = true) }
+        composed.change(SoftKeyboard.PAD + "hello ")
+        assertEquals("hello ", committed.sent()); assertEquals("hello ", composed.sent())
+        assertEquals(0, composed.resets)
+        // A composing word replaced by the keyboard's choice: only the differing tail is retyped.
+        val replaced = Field(); replaced.type("helo", composing = true)
+        assertEquals(SoftKeyboardEdit(1, "lo"), replaced.change(SoftKeyboard.PAD + "hello", composing = true))
+    }
+
+    @Test fun anEmojiIsOneCharacterToDeleteAndTheCursorMovingWithoutTextSendsNothing() {
+        val field = Field()
+        field.type("a😀")
+        assertEquals(SoftKeyboardEdit(1, ""), field.backspace(2))
+        assertEquals(SoftKeyboardEdit(0, ""), field.change(field.text))
+        assertEquals(0, field.resets)
+    }
+
+    @Test fun longTypingStartsOverOnceAndNothingTypedIsLost() {
+        val field = Field(); val typed = "0123456789".repeat(15)
+        typed.forEach { field.type(it.toString()) }
+        assertEquals(typed, field.sent())
+        assertEquals(1, field.resets)
+        assertTrue(field.text.length < SoftKeyboard.MAX_LENGTH)
+        // A composing keyboard is not interrupted by the soft limit, only by the hard one.
+        val composing = Field(); repeat(SoftKeyboard.MAX_LENGTH) { composing.type("a", composing = true) }
+        assertEquals(0, composing.resets)
+        repeat(SoftKeyboard.HARD_LIMIT) { composing.type("a", composing = true) }
+        assertTrue(composing.resets >= 1)
+    }
+
+    @Test fun softKeyboardEditsAreDroppedInViewOnlyMode() {
+        val (sink, input) = input()
+        input.viewOnly = true
+        applySoftKeyboardEdit(input, 2, "ab")
+        assertTrue(sink.events.isEmpty())
+        input.viewOnly = false
+        applySoftKeyboardEdit(input, 1, "a")
+        assertEquals(tap(KeySyms.BACKSPACE, 'a'.code), sink.keys())
     }
 }

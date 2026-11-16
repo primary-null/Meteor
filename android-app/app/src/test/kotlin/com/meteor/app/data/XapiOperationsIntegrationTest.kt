@@ -73,6 +73,8 @@ class XapiOperationsIntegrationTest {
     @Volatile private var taskError: List<String> = emptyList()
     @Volatile private var dropAsyncResponse = false
     private var rpcErrors = emptyMap<String, String>()
+    /** Journaled operation hardening: this read method answers HTTP 500 while the journal holds a SUBMITTING record. */
+    @Volatile private var failWhileSubmitting: String? = null
     private var superuser = true
     private val hosts = mapOf(
         "host-a-ref" to mapOf("uuid" to "host-a", "name_label" to "Host A", "enabled" to true, "metrics" to "metrics-a"),
@@ -97,7 +99,9 @@ class XapiOperationsIntegrationTest {
                         value(mapOf("Status" to "Failure", "ErrorDescription" to listOf(failure, "detail"))) + "</value></param></params></methodResponse>"
                     else -> response(result(method, args))
                 }
-                if (dropAsyncResponse && method.startsWith("Async.")) {
+                if (method == failWhileSubmitting && store.records.values.any { it.phase == PowerPhase.SUBMITTING }) {
+                    exchange.sendResponseHeaders(500, -1) // the pre-send identity read fails after the write-ahead barrier
+                } else if (dropAsyncResponse && method.startsWith("Async.")) {
                     // The request reached the server and was applied, but the reply is lost.
                     exchange.sendResponseHeaders(500, -1)
                 } else {
@@ -144,8 +148,10 @@ class XapiOperationsIntegrationTest {
         "VM.get_by_uuid" -> "vm-ref"
         "VM.get_record" -> mapOf("uuid" to "vm-id", "name_label" to "Fixture VM", "power_state" to power, "resident_on" to resident,
             "VCPUs_max" to "2", "memory_static_max" to "4096", "metrics" to "vm-metrics", "VBDs" to emptyList<String>(),
-            "VIFs" to emptyList<String>(), "allowed_operations" to allowed(), "current_operations" to emptyMap<String, String>())
+            "VIFs" to emptyList<String>(), "allowed_operations" to allowed(), "current_operations" to emptyMap<String, String>(),
+            "guest_metrics" to "vm-guest")
         "VM_metrics.get_record" -> mapOf("start_time" to boot)
+        "VM_guest_metrics.get_record" -> mapOf("live" to false)
         "host.get_all_records" -> hosts
         "host_metrics.get_all_records" -> metrics
         "host.get_record" -> hosts.getValue(args[1])
@@ -259,5 +265,78 @@ class XapiOperationsIntegrationTest {
         assertFalse(gateway.permissions(profile).known)
         assertTrue(asyncCalls().isEmpty())
         assertEquals("session.logout", calls.last())
+    }
+
+    // --- journaled operation hardening ---
+
+    @Test fun aFailedIdentityReadAfterTheBarrierIsRecordedAsNotSent() = runBlocking {
+        for (method in listOf("pool.get_all_records", "VM.get_record")) {
+            failWhileSubmitting = method
+            val result = run(PowerAction.HARD_SHUTDOWN)
+            assertEquals(result.message, PowerPhase.FAILED, result.phase); assertFalse(result.unresolved)
+            assertEquals("Not sent: Could not read the VM again just before sending (http-error).", result.message)
+            assertTrue(asyncCalls().isEmpty())
+        }
+        // The chosen host is read again at send time too.
+        failWhileSubmitting = "host.get_record"
+        val target = gateway.hostChoices(profile, "pool-id", "vm-id").single { it.uuid == "host-b" }
+        val migrate = run(PowerAction.POOL_MIGRATE, target)
+        assertEquals(migrate.message, PowerPhase.FAILED, migrate.phase); assertTrue(migrate.message.startsWith("Not sent:"))
+        assertTrue(asyncCalls().isEmpty())
+        // The fence is released: the action can be confirmed and sent once.
+        failWhileSubmitting = null
+        assertEquals(PowerPhase.SUCCEEDED, run(PowerAction.HARD_SHUTDOWN).phase)
+        assertEquals(listOf("Async.VM.hard_shutdown"), asyncCalls())
+    }
+
+    @Test fun aWriteWhoseReplyIsLostStaysUncertain() = runBlocking {
+        dropAsyncResponse = true
+        val lost = run(PowerAction.SUSPEND)
+        assertEquals(PowerPhase.UNKNOWN, lost.phase); assertTrue(lost.unresolved)
+        assertEquals("Suspended", power) // applied by the server although the reply was lost
+    }
+
+    @Test fun vmDeletedFromAnotherToolCanBeClosedAfterReviewWithoutSuccess() = runBlocking {
+        taskStatus = "pending"
+        val waiting = run(PowerAction.PAUSE)
+        assertTrue(waiting.unresolved); assertEquals("OpaqueRef:task-1", waiting.taskRef)
+        rpcErrors = mapOf("VM.get_by_uuid" to "UUID_INVALID")
+        val taskReads = calls.count { it.startsWith("task.") }
+        val checked = service.reconcile(profile, store.load().single())
+        assertTrue(checked.unresolved); assertTrue(checked.message, checked.message.contains("no longer exists"))
+        assertEquals(taskReads, calls.count { it.startsWith("task.") }) // nothing is observed for a VM that cannot be verified
+        val review = service.review(profile, store.load().single())
+        assertEquals(ReviewSubject.VM_MISSING, review.subject)
+        // The pool identity was read before the VM lookup.
+        val lookup = calls.lastIndexOf("VM.get_by_uuid")
+        assertEquals("pool.get_all_records", calls[lookup - 1])
+        val closed = service.resolveAfterReview(profile, review, true)
+        assertFalse(closed.unresolved); assertEquals(PowerPhase.UNKNOWN, closed.phase)
+        assertTrue(closed.message.contains("remains unverified"))
+        assertFalse(store.load().single().unresolved)
+        assertEquals(listOf("Async.VM.pause"), asyncCalls())
+    }
+
+    @Test fun otherVmLookupErrorsAndAnotherPoolKeepTheRecordLocked() = runBlocking {
+        dropAsyncResponse = true
+        run(PowerAction.PAUSE)
+        dropAsyncResponse = false
+        rpcErrors = mapOf("VM.get_by_uuid" to "RBAC_PERMISSION_DENIED")
+        assertTrue(runCatching { service.review(profile, store.load().single()) }.isFailure)
+        rpcErrors = mapOf("pool.get_all_records" to "UUID_INVALID")
+        assertTrue(runCatching { service.review(profile, store.load().single()) }.isFailure)
+        assertTrue(store.load().single().unresolved)
+        assertEquals(listOf("Async.VM.pause"), asyncCalls())
+    }
+
+    @Test fun trackingAndReviewUseTheLightStateRead() = runBlocking {
+        val result = run(PowerAction.HARD_SHUTDOWN)
+        assertEquals(PowerPhase.SUCCEEDED, result.phase)
+        // Two full reads: the one that built the confirmation and execute's fresh confirmation read. Verification adds none.
+        assertEquals(2, calls.count { it == "VM_guest_metrics.get_record" })
+        assertTrue(calls.contains("VM_metrics.get_record"))
+        val state = gateway.powerConnection(profile) { vmState("pool-id", "vm-id") }
+        assertEquals("Halted", state?.power); assertTrue(state!!.disks.isEmpty())
+        assertEquals(2, calls.count { it == "VM_guest_metrics.get_record" })
     }
 }

@@ -44,6 +44,8 @@ data class Inventory(
     val authority: String, val poolName: String, val hosts: List<Host>, val guests: List<Guest>,
     val storageTotal: Long, val storageUsed: Long, val observedAtMillis: Long,
     val repositories: List<StorageRepository> = emptyList(),
+    // --- inventory scale --- what could not be loaded (for example a VM list beyond the read limits); shown, never hidden
+    val notLoaded: List<String> = emptyList(),
 )
 data class VmGroup(val id: String, val name: String, val subtitle: String, val guests: List<Guest>)
 

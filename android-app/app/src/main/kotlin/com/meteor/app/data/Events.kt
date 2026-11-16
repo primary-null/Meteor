@@ -14,7 +14,9 @@ data class EventBatch(val token: String, val events: List<ServerEvent>)
 interface EventSession {
     /**
      * Returns the current event token. It subscribes to the small `pool` class only, so the first call does not
-     * download a snapshot of every VM, template, VBD and VIF. Tokens are not tied to a class set.
+     * download a snapshot of every VM, template, VBD and VIF. The token is accepted for the full class list afterwards,
+     * but a real server answers the first follow-up with a backlog of the newly named classes (34 events, up to about
+     * 137 KB on a small pool; METEOR-LIVE-FINDINGS E3), so the first refresh is bigger than a later one.
      */
     suspend fun begin(): String
     /** Long-polls for [timeoutSeconds]; returns early when something changes. Cancelling aborts the HTTP call. */
@@ -105,7 +107,10 @@ data class EventTriggers(
 }
 
 enum class EventFailureKind {
-    /** The server dropped events or the answer was too large: take a fresh token and re-read everything. */
+    /**
+     * The server dropped events, rejected the token (`EVENT_FROM_TOKEN_PARSE_FAILURE`, what a real XCP-ng 8.3 answers for
+     * a malformed token) or the answer was too large: take a fresh token and re-read everything.
+     */
     EVENTS_LOST,
     /** The session is gone: log in again and re-read everything. */
     SESSION_INVALID,
@@ -117,8 +122,9 @@ enum class EventFailureKind {
 object EventFailures {
     private val slow = setOf("HOST_IS_SLAVE", "SESSION_AUTHENTICATION_FAILED", "RBAC_PERMISSION_DENIED", "PERMISSION_DENIED",
         "MESSAGE_METHOD_UNKNOWN", "NOT_IMPLEMENTED")
+    private val lost = setOf("EVENTS_LOST", "EVENT_FROM_TOKEN_PARSE_FAILURE")
     fun classify(error: Throwable): EventFailureKind = when {
-        error is RpcFailure && error.code == "EVENTS_LOST" -> EventFailureKind.EVENTS_LOST
+        error is RpcFailure && error.code in lost -> EventFailureKind.EVENTS_LOST
         error is RpcFailure && error.code == "SESSION_INVALID" -> EventFailureKind.SESSION_INVALID
         error is RpcFailure && error.code in slow -> EventFailureKind.SLOW
         error is UnsupportedOperationException -> EventFailureKind.SLOW

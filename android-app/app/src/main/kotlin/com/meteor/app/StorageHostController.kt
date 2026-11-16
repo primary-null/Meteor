@@ -38,6 +38,7 @@ internal class StorageHostController(
     private val friendly: (Throwable) -> String, private val publish: suspend (PowerOperation) -> Unit,
     private val recover: suspend (Throwable) -> Unit, private val refresh: () -> Unit,
     private val clock: () -> Long = System::currentTimeMillis,
+    private val runs: OperationRuns = OperationRuns(state, publish), // stop watching
 ) {
     private var vmRequest = 0L
     private var hostRequest = 0L
@@ -208,7 +209,7 @@ internal class StorageHostController(
         if (confirmation.action == TargetAction.SNAPSHOT_TAKE && TargetRules.snapshotNameProblem(confirmation.snapshotName) != null) return
         state.update { it.copy(operationBusy = true, storageHost = it.storageHost.copy(pending = null)) }
         scope.launch {
-            try { power.executeTarget(profile, confirmation, publish) }
+            try { runs.run { changed -> power.executeTarget(profile, confirmation, changed) } } // stop watching
             catch (error: Exception) {
                 if (error is CancellationException) throw error
                 recover(error)
