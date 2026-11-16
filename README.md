@@ -8,6 +8,19 @@
   <img src="design/assets/silver-hybrid.png" alt="Meteor icon artwork" width="160">
 </p>
 
+## Screenshots
+
+Taken on a foldable phone's inner display against the project's local XCP-ng simulator, so every pool, host, VM, address and alert shown is made up.
+
+| | |
+| --- | --- |
+| ![Overview: capacity, pool and hosts](docs/screenshots/overview.png) | ![The fleet with a VM's details beside it](docs/screenshots/fleet-and-details.png) |
+| Overview: capacity, the pool and its hosts | The fleet, with a VM's details beside the list |
+| ![The VM console with the special-key bar](docs/screenshots/console.png) | ![Editing a VM's settings](docs/screenshots/vm-settings.png) |
+| The VM console with the special-key bar (the simulator's stand-in guest screen) | Editing a VM's name, description, tags and resources |
+| ![Two hours of CPU and memory history](docs/screenshots/performance-history.png) | ![The alerts inbox](docs/screenshots/alerts.png) |
+| Performance history from the server's recorded archives | The alerts inbox with priority and kind filters |
+
 ## Download and install
 
 **No signed APK has been published yet.** Once the first release is signed and published, its APK will appear on the **[Releases page](https://github.com/primary-null/Meteor/releases)**. Meteor needs Android 12 (API 31) or newer.
